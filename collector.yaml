@@ -1,0 +1,51 @@
+receivers:
+  filelog:
+    include: [input.log]
+    start_at: beginning
+
+processors:
+  filter/include_matched:
+    logs:
+      include:
+        match_type: regexp
+        bodies:
+          - ".*(user|userID|user_id)=\\S+.*"
+  filter/exclude_matched:
+    logs:
+      exclude:
+        match_type: regexp
+        bodies:
+          - ".*(user|userID|user_id)=\\S+.*"
+
+connectors:
+  logs_to_spans:
+    service_name: my-app
+    timeout: 30s
+    group_by_keys:
+      - user
+      - userID
+      - user_id
+    end_span_duration: 500ms
+    unmatched_behaviour: drop
+
+exporters:
+  debug:
+    verbosity: detailed
+  otlp/jaeger:
+    endpoint: 127.0.0.1:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    logs/matched:
+      receivers: [filelog]
+      processors: [filter/include_matched]
+      exporters: [logs_to_spans]
+    logs/unmatched:
+      receivers: [filelog]
+      processors: [filter/exclude_matched]
+      exporters: [debug]
+    traces:
+      receivers: [logs_to_spans]
+      exporters: [debug, otlp/jaeger]

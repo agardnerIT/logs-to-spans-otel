@@ -1,0 +1,26 @@
+dist:
+  name: otelcol-logs-to-spans
+  description: Custom OpenTelemetry Collector distribution with logs-to-spans connector
+  output_path: ./otelcol-dist
+
+connectors:
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.1.0"
+    path: "."
+    name: "logs_to_spans"
+
+exporters:
+  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.154.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/otlpexporter v0.154.0"
+
+receivers:
+  - gomod: "go.opentelemetry.io/collector/receiver/otlpreceiver v0.154.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.154.0"
+
+processors:
+  - gomod: "go.opentelemetry.io/collector/processor/batchprocessor v0.154.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.154.0"
+
+providers:
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.48.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.48.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.48.0"

@@ -1,0 +1,9 @@
+INFO Hello world userID=123
+{"status": "INFO", "content": "this is a log line user=123 and here is content"}
+2026-10-25 10:00:00 ERROR user_id=123 Hello world
+INFO Foo bar
+INFO foo userID=222
+user=23 started a transaction
+user_id=222 step 2
+user_id=222 completion status=success
+user_id=23 step 3. all done
