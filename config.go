@@ -6,6 +6,7 @@ import (
 
 type Config struct {
 	Timeout            time.Duration `mapstructure:"timeout"`
+	MaxWait            time.Duration `mapstructure:"max_wait"`
 	GroupByKeys        []string      `mapstructure:"group_by_keys"`
 	EndSpanDuration    time.Duration `mapstructure:"end_span_duration"`
 	UnmatchedBehaviour string        `mapstructure:"unmatched_behaviour"`
@@ -15,6 +16,9 @@ type Config struct {
 func (cfg *Config) Validate() error {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 5 * time.Second
+	}
+	if cfg.MaxWait <= 0 {
+		cfg.MaxWait = 30 * time.Second
 	}
 	if cfg.EndSpanDuration <= 0 {
 		cfg.EndSpanDuration = 500 * time.Millisecond
@@ -31,6 +35,7 @@ func (cfg *Config) Validate() error {
 func createDefaultConfig() *Config {
 	return &Config{
 		Timeout:            5 * time.Second,
+		MaxWait:            30 * time.Second,
 		GroupByKeys:        []string{},
 		EndSpanDuration:    500 * time.Millisecond,
 		UnmatchedBehaviour: "drop",

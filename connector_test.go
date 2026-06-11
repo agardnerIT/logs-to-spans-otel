@@ -75,6 +75,7 @@ func TestConfigDefaults(t *testing.T) {
 	assert.Equal(t, 500*time.Millisecond, cfg.EndSpanDuration)
 	assert.Equal(t, "drop", cfg.UnmatchedBehaviour)
 	assert.Equal(t, "logs-to-spans", cfg.ServiceName)
+	assert.Equal(t, 30*time.Second, cfg.MaxWait)
 	assert.Empty(t, cfg.GroupByKeys)
 }
 

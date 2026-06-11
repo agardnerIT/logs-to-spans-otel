@@ -60,6 +60,7 @@ connectors:
   logs_to_spans:
     service_name: my-app        # service.name on produced spans (default: "logs-to-spans")
     timeout: 5s                 # inactivity timeout before flushing a group
+    max_wait: 30s               # absolute max time from first log (prevents starvation)
     group_by_keys:              # keys to extract and group by (tried in order)
       - user
       - userID
@@ -118,7 +119,7 @@ Add this connector to your OCB `builder-config.yaml`:
 
 ```yaml
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.1.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.2.0"
     name: "logs_to_spans"
 
 exporters:
@@ -196,6 +197,20 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 ├── connector.go         # Core implementation
 └── connector_test.go    # Reusable test harness
 ```
+
+## Changelog
+
+### v0.2.0
+
+- Initial public release
+- Core connector: `logs_to_spans` (Logs → Traces)
+- Key extraction from structured (Map) and unstructured (string) bodies
+- Per-group inactivity timer and max-wait timer (prevents starvation)
+- Configurable group-by keys, timeout, end-span duration, service name
+- Parent-child span chains preserving log order
+- Flush-on-shutdown
+- 15 tests covering grouping, sorting, duration, shutdown, key extraction, and service name
+- OCB builder config for custom collector distributions
 
 ## License
 

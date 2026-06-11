@@ -26,9 +26,10 @@ type logsToSpansConnector struct {
 }
 
 type logGroup struct {
-	key     string
-	records []*logRecord
-	timer   *time.Timer
+	key       string
+	records   []*logRecord
+	timer     *time.Timer
+	maxTimer  *time.Timer
 }
 
 type logRecord struct {
@@ -69,11 +70,16 @@ func (c *logsToSpansConnector) Shutdown(ctx context.Context) error {
 	c.mu.Unlock()
 
 	c.mu.Lock()
-	groups := make([]*logGroup, 0, len(c.groups))
 	for _, g := range c.groups {
 		if g.timer != nil {
 			g.timer.Stop()
 		}
+		if g.maxTimer != nil {
+			g.maxTimer.Stop()
+		}
+	}
+	groups := make([]*logGroup, 0, len(c.groups))
+	for _, g := range c.groups {
 		groups = append(groups, g)
 	}
 	c.groups = make(map[string]*logGroup)
@@ -97,6 +103,9 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 	if !exists {
 		group = &logGroup{key: key}
 		c.groups[key] = group
+		group.maxTimer = time.AfterFunc(c.config.MaxWait, func() {
+			c.flushGroup(key, group)
+		})
 	}
 
 	group.records = append(group.records, extractLogRecord(lr))
@@ -105,15 +114,25 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		group.timer.Stop()
 	}
 	group.timer = time.AfterFunc(c.config.Timeout, func() {
-		c.mu.Lock()
-		if c.stopped {
-			c.mu.Unlock()
-			return
-		}
-		delete(c.groups, key)
-		c.mu.Unlock()
-		c.processGroup(context.Background(), group)
+		c.flushGroup(key, group)
 	})
+}
+
+func (c *logsToSpansConnector) flushGroup(key string, group *logGroup) {
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		return
+	}
+	delete(c.groups, key)
+	if group.maxTimer != nil {
+		group.maxTimer.Stop()
+	}
+	if group.timer != nil {
+		group.timer.Stop()
+	}
+	c.mu.Unlock()
+	c.processGroup(context.Background(), group)
 }
 
 func extractLogRecord(lr plog.LogRecord) *logRecord {

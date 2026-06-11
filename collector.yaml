@@ -20,7 +20,8 @@ processors:
 connectors:
   logs_to_spans:
     service_name: my-app
-    timeout: 30s
+    timeout: 5s
+    max_wait: 30s
     group_by_keys:
       - user
       - userID
