@@ -119,7 +119,6 @@ Add this connector to your OCB `builder-config.yaml`:
 ```yaml
 connectors:
   - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.1.0"
-    path: "./path/to/local/checkout"
     name: "logs_to_spans"
 
 exporters:
@@ -146,7 +145,7 @@ Build:
 ocb --config builder-config.yaml
 ```
 
-> **Note:** remove the `path` override once the module is published — OCB fetches it from the Go module proxy automatically.
+> **Local development:** if you're testing changes before publishing, add `path: "."` alongside the `gomod` entry to point OCB at your local checkout.
 
 ## Development
 
