@@ -113,6 +113,48 @@ service:
       exporters: [otlp]
 ```
 
+## Grouping non k=v logs
+
+The connector extracts group keys using a `key=value` pattern by default. If your logs use a different format (e.g. space-separated, colon-delimited), you have two options:
+
+### Option 1: Transform processor (recommended)
+
+Use the `transform` processor to rewrite log bodies into `key=value` format before they reach the connector:
+
+```yaml
+processors:
+  transform/normalize_logs:
+    log_statements:
+      - context: log
+        statements:
+          # "user 123" → "user=123"
+          - replace_pattern(body, `\buser\s+(\S+)`, `user=${1}`)
+          # "user: 123" → "user=123"
+          - replace_pattern(body, `\buser:\s+(\S+)`, `user=${1}`)
+```
+
+Pipeline wiring:
+
+```yaml
+service:
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [transform/normalize_logs]
+      exporters: [logs_to_spans]
+    traces:
+      receivers: [logs_to_spans]
+      exporters: [otlp]
+```
+
+This keeps the connector simple — the transform processor handles all format normalization upstream.
+
+### Option 2: Filelog receiver operators
+
+If you control the filelog receiver config, you can use `regex_parser` to extract structured fields. However, the connector only reads from the log body (not attributes), so the extracted value needs to end up in the body for `group_by_keys` to find it.
+
+This is more involved than the transform processor and loses the original log message in the body, so **the transform processor is generally the better choice**.
+
 ## Including in your own collector build
 
 Add this connector to your OCB `builder-config.yaml`:
