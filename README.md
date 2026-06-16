@@ -57,17 +57,34 @@ Logs that don't match any key are silently dropped (or you can split them into a
 
 ## Configuration
 
+### Reference
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `service_name` | string | `"logs-to-spans"` | Value of the `service.name` resource attribute on produced spans. |
+| `timeout` | duration | `5s` | **Inactivity timeout.** Resets every time a new log arrives for a group. When no new logs arrive for this long, the group is flushed and converted to a trace. |
+| `max_wait` | duration | `30s` | **Absolute max wait.** Maximum time from the *first* log in a group before it is force-flushed — regardless of ongoing activity. Prevents groups with continuous log streams from never being emitted. |
+| `group_by_keys` | string list | `[]` | Keys to extract from each log body and group by (tried in order). See [Key extraction](#key-extraction). |
+| `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
+| `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
+| `unmatched_behaviour` | string | `"drop"` | What to do with logs that don't match any `group_by_keys`: `"drop"` (silently discard) or `"pass_through"` (forward unchanged to a separate pipeline). |
+
+> **`timeout` vs `max_wait`:** `timeout` is a *sliding* inactivity window — it resets every time a new log arrives. `max_wait` is a *fixed* deadline from the moment the group is created. A group is flushed when *either* timer fires first.
+
+### Example
+
 ```yaml
 connectors:
   logs_to_spans:
-    service_name: my-app        # service.name on produced spans (default: "logs-to-spans")
-    timeout: 5s                 # inactivity timeout before flushing a group
-    max_wait: 30s               # absolute max time from first log (prevents starvation)
-    group_by_keys:              # keys to extract and group by (tried in order)
+    service_name: my-app
+    timeout: 5s
+    max_wait: 30s
+    group_by_keys:
       - user
       - userID
       - user_id
-    end_span_duration: 500ms   # duration of the final span in each trace
+    end_span_duration: 500ms
+    unmatched_behaviour: drop
 ```
 
 ### Pipeline wiring
