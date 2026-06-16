@@ -4,6 +4,8 @@
 
 **Convert log records into trace spans** by grouping logs that share a common attribute value (e.g. `userID=123`). Each group becomes a single trace, with every log ordered by timestamp becoming a span in that trace.
 
+> **This connector is not included in any official OpenTelemetry Collector distribution.** You must build your own custom Collector using the [OpenTelemetry Collector Builder (OCB)](https://opentelemetry.io/docs/collector/extend/ocb/). The builder binary is available as a downloadable asset from [OpenTelemetry Collector releases](https://github.com/open-telemetry/opentelemetry-collector-releases/tags) (look for `cmd/builder` tags). Docker images can be built using the [Dockerfile](#containerize-your-collector-distribution) example below. A ready-to-use [`builder-config.yaml`](builder-config.yaml) is included in this repo.
+
 ## Why?
 
 Standard log aggregators treat each line as an independent event — you lose the _relationship_ between log lines that belong to the same user session, request, or workflow.
