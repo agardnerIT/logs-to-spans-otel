@@ -1,5 +1,7 @@
 # logs-to-spans — OpenTelemetry Collector Connector
 
+<img width="459" height="238" alt="logs-to-spans" src="https://github.com/user-attachments/assets/674194ca-7573-43b7-91dd-b70a5a6bb419" />
+
 **Convert log records into trace spans** by grouping logs that share a common attribute value (e.g. `userID=123`). Each group becomes a single trace, with every log ordered by timestamp becoming a span in that trace.
 
 ## Why?
