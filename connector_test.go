@@ -1175,3 +1175,247 @@ func TestServiceNameDefaultWhenEmpty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "logs-to-spans", cfg.ServiceName)
 }
+
+func TestConfigDefaultMaxLogsPerTrace(t *testing.T) {
+	cfg := createDefaultConfig()
+	assert.Equal(t, 100, cfg.MaxLogsPerTrace)
+}
+
+func TestConfigValidateNegativeMaxLogsPerTrace(t *testing.T) {
+	cfg := &Config{MaxLogsPerTrace: -1}
+	err := cfg.Validate()
+	require.NoError(t, err)
+	assert.Equal(t, 100, cfg.MaxLogsPerTrace)
+}
+
+func TestConfigValidateZeroMaxLogsPerTrace(t *testing.T) {
+	cfg := &Config{MaxLogsPerTrace: 0}
+	err := cfg.Validate()
+	require.NoError(t, err)
+	assert.Equal(t, 0, cfg.MaxLogsPerTrace)
+}
+
+func TestMaxLogsPerTraceFlushesAtLimit(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 3
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	r1 := newLogRecord("user=123 log1", now, "INFO")
+	r2 := newLogRecord("user=123 log2", now.Add(1*time.Second), "INFO")
+	r3 := newLogRecord("user=123 log3", now.Add(2*time.Second), "INFO")
+	r4 := newLogRecord("user=123 log4", now.Add(3*time.Second), "INFO")
+	r5 := newLogRecord("user=123 log5", now.Add(4*time.Second), "INFO")
+
+	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4, r5})
+	conn.Shutdown(context.Background())
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2, "expected 2 traces: 3 logs in first, 2 in second")
+	assert.Equal(t, 3, traces[0].SpanCount())
+	assert.Equal(t, 2, traces[1].SpanCount())
+}
+
+func TestMaxLogsPerTraceExactLimit(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 3
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	r1 := newLogRecord("user=123 log1", now, "INFO")
+	r2 := newLogRecord("user=123 log2", now.Add(1*time.Second), "INFO")
+	r3 := newLogRecord("user=123 log3", now.Add(2*time.Second), "INFO")
+	r4 := newLogRecord("user=123 log4", now.Add(3*time.Second), "INFO")
+	r5 := newLogRecord("user=123 log5", now.Add(4*time.Second), "INFO")
+	r6 := newLogRecord("user=123 log6", now.Add(5*time.Second), "INFO")
+
+	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4, r5, r6})
+
+	time.Sleep(200 * time.Millisecond)
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2, "expected 2 traces: 3+3 logs")
+	assert.Equal(t, 3, traces[0].SpanCount())
+	assert.Equal(t, 3, traces[1].SpanCount())
+}
+
+func TestMaxLogsPerTraceBelowLimit(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 5
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	r1 := newLogRecord("user=123 log1", now, "INFO")
+	r2 := newLogRecord("user=123 log2", now.Add(1*time.Second), "INFO")
+
+	sendLogs(t, conn, []plog.LogRecord{r1, r2})
+
+	time.Sleep(300 * time.Millisecond)
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1, "expected 1 trace flushed by timeout")
+	assert.Equal(t, 2, traces[0].SpanCount())
+}
+
+func TestMaxLogsPerTraceZeroMeansNoLimit(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 0
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	records := make([]plog.LogRecord, 10)
+	for i := 0; i < 10; i++ {
+		records[i] = newLogRecord("user=123 log", now.Add(time.Duration(i)*time.Second), "INFO")
+	}
+
+	sendLogs(t, conn, records)
+
+	time.Sleep(300 * time.Millisecond)
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1, "expected 1 trace with all 10 spans")
+	assert.Equal(t, 10, traces[0].SpanCount())
+}
+
+func TestMaxLogsPerTraceSpanLinks(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 3
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	r1 := newLogRecord("user=123 log1", now, "INFO")
+	r2 := newLogRecord("user=123 log2", now.Add(1*time.Second), "INFO")
+	r3 := newLogRecord("user=123 log3", now.Add(2*time.Second), "INFO")
+	r4 := newLogRecord("user=123 log4", now.Add(3*time.Second), "INFO")
+
+	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4})
+	conn.Shutdown(context.Background())
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2)
+
+	firstSpanOfSecondTrace := traces[1].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	require.Equal(t, 1, firstSpanOfSecondTrace.Links().Len(), "second trace should have 1 span link")
+
+	link := firstSpanOfSecondTrace.Links().At(0)
+	firstTraceID := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).TraceID()
+	assert.Equal(t, firstTraceID, link.TraceID(), "link should point to first trace")
+
+	lastSpanOfFirstTrace := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(2)
+	assert.Equal(t, lastSpanOfFirstTrace.SpanID(), link.SpanID(), "link should point to last span of first trace")
+}
+
+func TestMaxLogsPerTraceSpanLinkChain(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 3
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	records := make([]plog.LogRecord, 9)
+	for i := 0; i < 9; i++ {
+		records[i] = newLogRecord("user=123 log", now.Add(time.Duration(i)*time.Second), "INFO")
+	}
+
+	sendLogs(t, conn, records)
+
+	time.Sleep(200 * time.Millisecond)
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 3, "expected 3 traces: 3+3+3")
+
+	// Trace B links to Trace A
+	spanB0 := traces[1].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	require.Equal(t, 1, spanB0.Links().Len())
+	assert.Equal(t, traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).TraceID(), spanB0.Links().At(0).TraceID())
+	assert.Equal(t, traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(2).SpanID(), spanB0.Links().At(0).SpanID())
+
+	// Trace C links to Trace B
+	spanC0 := traces[2].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	require.Equal(t, 1, spanC0.Links().Len())
+	assert.Equal(t, traces[1].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).TraceID(), spanC0.Links().At(0).TraceID())
+	assert.Equal(t, traces[1].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(2).SpanID(), spanC0.Links().At(0).SpanID())
+}
+
+func TestMaxLogsPerTraceSeparateGroups(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 2
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	r1 := newLogRecord("user=aaa log1", now, "INFO")
+	r2 := newLogRecord("user=aaa log2", now.Add(1*time.Second), "INFO")
+	r3 := newLogRecord("user=aaa log3", now.Add(2*time.Second), "INFO")
+	r4 := newLogRecord("user=bbb log1", now, "INFO")
+	r5 := newLogRecord("user=bbb log2", now.Add(1*time.Second), "INFO")
+	r6 := newLogRecord("user=bbb log3", now.Add(2*time.Second), "INFO")
+
+	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4, r5, r6})
+	conn.Shutdown(context.Background())
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 4, "expected 4 traces: 2 per user")
+
+	aaaTraces := 0
+	bbbTraces := 0
+	for _, td := range traces {
+		span := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+		val, _ := span.Attributes().Get("group.key")
+		if val.Str() == "aaa" {
+			aaaTraces++
+		} else if val.Str() == "bbb" {
+			bbbTraces++
+		}
+	}
+	assert.Equal(t, 2, aaaTraces)
+	assert.Equal(t, 2, bbbTraces)
+}
+
+func TestMaxLogsPerTraceWithTimeout(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 10
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	r1 := newLogRecord("user=123 log1", now, "INFO")
+	r2 := newLogRecord("user=123 log2", now.Add(1*time.Second), "INFO")
+
+	sendLogs(t, conn, []plog.LogRecord{r1, r2})
+
+	time.Sleep(300 * time.Millisecond)
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1, "timeout should flush the group")
+	assert.Equal(t, 2, traces[0].SpanCount())
+}

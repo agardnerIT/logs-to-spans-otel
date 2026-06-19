@@ -27,10 +27,14 @@ type logsToSpansConnector struct {
 }
 
 type logGroup struct {
-	key       string
-	records   []*logRecord
-	timer     *time.Timer
-	maxTimer  *time.Timer
+	key         string
+	records     []*logRecord
+	timer       *time.Timer
+	maxTimer    *time.Timer
+	prevTraceID pcommon.TraceID
+	prevSpanID  pcommon.SpanID
+	traceID     pcommon.TraceID
+	lastSpanID  pcommon.SpanID
 }
 
 type logRecord struct {
@@ -95,9 +99,9 @@ func (c *logsToSpansConnector) Shutdown(ctx context.Context) error {
 
 func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if c.stopped {
+		c.mu.Unlock()
 		return
 	}
 
@@ -118,6 +122,44 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 	group.timer = time.AfterFunc(c.config.Timeout, func() {
 		c.flushGroup(key, group)
 	})
+
+	if c.config.MaxLogsPerTrace > 0 && len(group.records) >= c.config.MaxLogsPerTrace {
+		traceID := generateTraceID()
+		lastSpanID := generateSpanID()
+		flushedRecords := group.records
+		flushedPrevTraceID := group.prevTraceID
+		flushedPrevSpanID := group.prevSpanID
+		delete(c.groups, key)
+		if group.maxTimer != nil {
+			group.maxTimer.Stop()
+		}
+		if group.timer != nil {
+			group.timer.Stop()
+		}
+
+		newGroup := &logGroup{key: key}
+		newGroup.prevTraceID = traceID
+		newGroup.prevSpanID = lastSpanID
+		c.groups[key] = newGroup
+		newGroup.maxTimer = time.AfterFunc(c.config.MaxWait, func() {
+			c.flushGroup(key, newGroup)
+		})
+		newGroup.timer = time.AfterFunc(c.config.Timeout, func() {
+			c.flushGroup(key, newGroup)
+		})
+		c.mu.Unlock()
+		c.processGroup(context.Background(), &logGroup{
+			key:         key,
+			records:     flushedRecords,
+			prevTraceID: flushedPrevTraceID,
+			prevSpanID:  flushedPrevSpanID,
+			traceID:     traceID,
+			lastSpanID:  lastSpanID,
+		})
+		return
+	}
+
+	c.mu.Unlock()
 }
 
 func (c *logsToSpansConnector) flushGroup(key string, group *logGroup) {
@@ -230,7 +272,10 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 		return group.records[i].timestamp.Before(group.records[j].timestamp)
 	})
 
-	traceID := generateTraceID()
+	traceID := group.traceID
+	if traceID == (pcommon.TraceID{}) {
+		traceID = generateTraceID()
+	}
 
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
@@ -241,7 +286,13 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 	for i, rec := range group.records {
 		span := ss.Spans().AppendEmpty()
 		span.SetTraceID(traceID)
-		span.SetSpanID(generateSpanID())
+
+		if i == len(group.records)-1 && group.lastSpanID != (pcommon.SpanID{}) {
+			span.SetSpanID(group.lastSpanID)
+		} else {
+			span.SetSpanID(generateSpanID())
+		}
+
 		span.SetName(rec.body)
 		span.SetStartTimestamp(pcommon.NewTimestampFromTime(rec.timestamp))
 		span.SetKind(ptrace.SpanKindInternal)
@@ -266,6 +317,12 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 		if i > 0 {
 			parentSpanID := ss.Spans().At(i - 1).SpanID()
 			span.SetParentSpanID(parentSpanID)
+		}
+
+		if i == 0 && group.prevTraceID != (pcommon.TraceID{}) {
+			link := span.Links().AppendEmpty()
+			link.SetTraceID(group.prevTraceID)
+			link.SetSpanID(group.prevSpanID)
 		}
 	}
 

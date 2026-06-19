@@ -72,6 +72,7 @@ Logs without a valid duration attribute fall back to the default behaviour: each
 | `service_name` | string | `"logs-to-spans"` | Value of the `service.name` resource attribute on produced spans. |
 | `timeout` | duration | `5s` | **Inactivity timeout.** Resets every time a new log arrives for a group. When no new logs arrive for this long, the group is flushed and converted to a trace. |
 | `max_wait` | duration | `30s` | **Absolute max wait.** Maximum time from the *first* log in a group before it is force-flushed — regardless of ongoing activity. Prevents groups with continuous log streams from never being emitted. |
+| `max_logs_per_trace` | int | `100` | **Max logs per trace.** Maximum number of log records in a single group/trace. When the limit is reached, the current group is flushed early and a new group starts. Set to `0` for no limit. Traces are connected via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links). |
 | `group_by_keys` | string list | `[]` | Keys to extract from each log body and group by (tried in order). See [Key extraction](#key-extraction). |
 | `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
@@ -87,6 +88,7 @@ connectors:
     service_name: my-app
     timeout: 5s
     max_wait: 30s
+    max_logs_per_trace: 100
     group_by_keys:
       - user
       - userID
@@ -192,7 +194,7 @@ Add this connector to your OCB `builder-config.yaml`:
 
 ```yaml
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.3.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.4.0"
     name: "logs_to_spans"
 
 exporters:
@@ -242,6 +244,7 @@ The test suite covers:
 - Configurable end-span duration
 - Flush-on-shutdown
 - Service name propagation
+- `max_logs_per_trace` limit, span links, and chain behaviour
 
 ### Quick start with filelog
 
@@ -272,6 +275,13 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 ```
 
 ## Changelog
+
+### v0.4.0
+
+- `max_logs_per_trace` config option to cap group size — prevents unbounded trace growth from high-volume sessions (default: 100, set to `0` for no limit)
+- When the limit is reached, the current group is flushed early and a new group starts with fresh timers
+- Span links connect consecutive traces from the same group, preserving the relationship across splits
+- 8 new tests covering limit flush, exact boundary, below limit, zero=no-limit, span links, chain, separate groups, and timeout interaction
 
 ### v0.3.0
 

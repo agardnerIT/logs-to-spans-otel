@@ -1,6 +1,6 @@
 dist:
   name: otelcol-logs-to-spans
-  version: 0.3.0
+  version: 0.4.0
   description: Custom OpenTelemetry Collector distribution with logs-to-spans connector
   output_path: ./otelcol-dist
 
