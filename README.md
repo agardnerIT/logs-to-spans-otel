@@ -85,6 +85,10 @@ connectors:
       - user
       - userID
       - user_id
+    duration_keys:
+      - duration
+      - time
+      - time-spent
     end_span_duration: 500ms
     unmatched_behaviour: drop
 ```
@@ -182,7 +186,7 @@ Add this connector to your OCB `builder-config.yaml`:
 
 ```yaml
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.2.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.3.0"
     name: "logs_to_spans"
 
 exporters:
@@ -262,6 +266,12 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 ```
 
 ## Changelog
+
+### v0.3.0
+
+- Configurable span duration via `duration_keys` — read explicit duration from log attributes (string, int, or double), falling back to `Timestamp` then `ObservedTimestamp`
+- Compile group-by regex once at startup instead of per log for better performance
+- 20+ new tests covering duration parsing, timestamp priority, regex compilation, config validation, and edge cases
 
 ### v0.2.0
 
