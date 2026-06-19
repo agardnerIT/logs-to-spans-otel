@@ -2,6 +2,12 @@ receivers:
   filelog:
     include: [input.log]
     start_at: beginning
+    operators:
+      - type: regex_parser
+        regex: '^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s+(?P<body>.*)$'
+        timestamp:
+          parse_from: attributes.ts
+          layout: '2006-01-02T15:04:05'
 
 processors:
   filter/include_matched:
@@ -23,9 +29,10 @@ connectors:
     timeout: 5s
     max_wait: 30s
     group_by_keys:
-      - user
+      - UID
       - userID
       - user_id
+      - sess_id
     end_span_duration: 500ms
     unmatched_behaviour: drop
 
@@ -39,14 +46,15 @@ exporters:
 
 service:
   pipelines:
-    logs/matched:
+    logs:
       receivers: [filelog]
-      processors: [filter/include_matched]
+      processors: []
       exporters: [logs_to_spans]
-    logs/unmatched:
-      receivers: [filelog]
-      processors: [filter/exclude_matched]
-      exporters: [debug]
     traces:
       receivers: [logs_to_spans]
       exporters: [debug, otlp/jaeger]
+
+
+
+
+

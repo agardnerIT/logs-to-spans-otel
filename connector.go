@@ -23,6 +23,7 @@ type logsToSpansConnector struct {
 	tracesConsumer consumer.Traces
 	mu             sync.Mutex
 	stopped        bool
+	compiledRegex  []*regexp.Regexp
 }
 
 type logGroup struct {
@@ -34,6 +35,7 @@ type logGroup struct {
 
 type logRecord struct {
 	timestamp time.Time
+	duration  time.Duration
 	body      string
 	severity  string
 }
@@ -53,7 +55,7 @@ func (c *logsToSpansConnector) ConsumeLogs(_ context.Context, ld plog.Logs) erro
 			sl := rl.ScopeLogs().At(j)
 			for k := 0; k < sl.LogRecords().Len(); k++ {
 				lr := sl.LogRecords().At(k)
-				key := extractGroupKey(lr, c.config.GroupByKeys)
+				key := c.extractGroupKey(lr)
 				if key == "" {
 					continue
 				}
@@ -108,7 +110,7 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		})
 	}
 
-	group.records = append(group.records, extractLogRecord(lr))
+	group.records = append(group.records, extractLogRecord(lr, c.config))
 
 	if group.timer != nil {
 		group.timer.Stop()
@@ -135,11 +137,44 @@ func (c *logsToSpansConnector) flushGroup(key string, group *logGroup) {
 	c.processGroup(context.Background(), group)
 }
 
-func extractLogRecord(lr plog.LogRecord) *logRecord {
+func extractLogRecord(lr plog.LogRecord, cfg *Config) *logRecord {
+	ts := lr.ObservedTimestamp().AsTime()
+	if lr.Timestamp() != 0 {
+		ts = lr.Timestamp().AsTime()
+	}
+
+	var dur time.Duration
+	for _, key := range cfg.DurationKeys {
+		if val, ok := lr.Attributes().Get(key); ok {
+			if d := parseDuration(val); d > 0 {
+				dur = d
+				break
+			}
+		}
+	}
+
 	return &logRecord{
-		timestamp: lr.ObservedTimestamp().AsTime(),
+		timestamp: ts,
+		duration:  dur,
 		body:      valueToString(lr.Body()),
 		severity:  lr.SeverityText(),
+	}
+}
+
+func parseDuration(v pcommon.Value) time.Duration {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		d, err := time.ParseDuration(v.Str())
+		if err != nil {
+			return 0
+		}
+		return d
+	case pcommon.ValueTypeInt:
+		return time.Duration(v.Int()) * time.Second
+	case pcommon.ValueTypeDouble:
+		return time.Duration(v.Double() * float64(time.Second))
+	default:
+		return 0
 	}
 }
 
@@ -154,8 +189,8 @@ func valueToString(v pcommon.Value) string {
 	}
 }
 
-func extractGroupKey(lr plog.LogRecord, keys []string) string {
-	if len(keys) == 0 {
+func (c *logsToSpansConnector) extractGroupKey(lr plog.LogRecord) string {
+	if len(c.config.GroupByKeys) == 0 {
 		return ""
 	}
 
@@ -163,7 +198,7 @@ func extractGroupKey(lr plog.LogRecord, keys []string) string {
 
 	if body.Type() == pcommon.ValueTypeMap {
 		m := body.Map()
-		for _, key := range keys {
+		for _, key := range c.config.GroupByKeys {
 			if val, ok := m.Get(key); ok {
 				s := val.AsString()
 				if s != "" {
@@ -175,8 +210,8 @@ func extractGroupKey(lr plog.LogRecord, keys []string) string {
 	}
 
 	bodyStr := valueToString(body)
-	for _, key := range keys {
-		re := regexp.MustCompile(key + `=(\S+)`)
+	for i := range c.config.GroupByKeys {
+		re := c.compiledRegex[i]
 		matches := re.FindStringSubmatch(bodyStr)
 		if len(matches) >= 2 && matches[1] != "" {
 			return matches[1]
@@ -212,7 +247,9 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 		span.SetKind(ptrace.SpanKindInternal)
 
 		var endTime time.Time
-		if i < len(group.records)-1 {
+		if rec.duration > 0 {
+			endTime = rec.timestamp.Add(rec.duration)
+		} else if i < len(group.records)-1 {
 			endTime = group.records[i+1].timestamp
 		} else {
 			endTime = rec.timestamp.Add(c.config.EndSpanDuration)

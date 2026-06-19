@@ -8,6 +8,7 @@ type Config struct {
 	Timeout            time.Duration `mapstructure:"timeout"`
 	MaxWait            time.Duration `mapstructure:"max_wait"`
 	GroupByKeys        []string      `mapstructure:"group_by_keys"`
+	DurationKeys       []string      `mapstructure:"duration_keys"`
 	EndSpanDuration    time.Duration `mapstructure:"end_span_duration"`
 	UnmatchedBehaviour string        `mapstructure:"unmatched_behaviour"`
 	ServiceName        string        `mapstructure:"service_name"`
@@ -37,6 +38,7 @@ func createDefaultConfig() *Config {
 		Timeout:            5 * time.Second,
 		MaxWait:            30 * time.Second,
 		GroupByKeys:        []string{},
+		DurationKeys:       []string{},
 		EndSpanDuration:    500 * time.Millisecond,
 		UnmatchedBehaviour: "drop",
 		ServiceName:        "logs-to-spans",
