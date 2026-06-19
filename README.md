@@ -57,6 +57,12 @@ The connector tries two strategies in order:
 
 Logs that don't match any key are silently dropped (or you can split them into a separate pipeline — see [Filtering unmatched logs](#filtering-unmatched-logs)).
 
+### Duration extraction
+
+The connector reads explicit span durations from log attributes by checking each key in `duration_keys` in order. Supported values: Go duration strings (`"5s"`, `"2m30s"`), integers (seconds), or floats (seconds).
+
+Logs without a valid duration attribute fall back to the default behaviour: each span's duration is the time delta to the next log, and the last span in a trace uses `end_span_duration`.
+
 ## Configuration
 
 ### Reference
