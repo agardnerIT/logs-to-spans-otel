@@ -56,7 +56,7 @@ func newTelemetry(settings component.TelemetrySettings) (*telemetry, error) {
 
 	unmatchedDropped, err := meter.Int64Counter(
 		metricUnmatchedDropped,
-		metric.WithDescription("Number of log records dropped because no group_by_keys entry matched."),
+		metric.WithDescription("Number of log records dropped because no group_by_keys or group_by_attributes entry matched."),
 		metric.WithUnit("{log_record}"),
 	)
 	if err != nil {

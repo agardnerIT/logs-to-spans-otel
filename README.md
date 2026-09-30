@@ -32,7 +32,7 @@ Use it when you have _unstructured_ or _semi-structured_ logs that you want to e
                     │   connector          │
                     │                      │
                     │  1. Extract key from  │
-                    │     each log body     │
+                    │     attr or body      │
                     │  2. Group by value    │
                     │     (e.g. "123")      │
                     │  3. Flush after       │
@@ -50,14 +50,17 @@ Use it when you have _unstructured_ or _semi-structured_ logs that you want to e
 
 ### Key extraction
 
-The connector tries two strategies in order:
+The group key can come from a log **attribute** or from the log **body**. The connector tries three strategies in order:
 
-1. **Structured (Map) body** — if the log body is a JSON object, it looks for top-level keys matching `group_by_keys`
-2. **Unstructured (string) body** — falls back to regex `key=(\S+)` to extract values
+1. **Log attributes** — looks for each key in `group_by_attributes`, in order. This is the right choice for structured logging: `filelog` with `json_parser`, OTLP-native applications, and any other source that emits fields as attributes rather than text.
+2. **Structured (Map) body** — if the log body is a JSON object, it looks for top-level keys matching `group_by_keys`, in order.
+3. **Unstructured (string) body** — falls back to the regex `key=(\S+)` for each `group_by_keys` entry, in order.
 
-`group_by_keys` entries are matched **literally**, not as regular expressions: `user.id` matches `user.id=42` but not `userXid=42`.
+`group_by_attributes` takes precedence over `group_by_keys`: once an attribute matches, the body is not consulted. Keys in both lists are matched **exactly and literally**, not as regular expressions. `user.id` matches an attribute named `user.id` (or `user.id=42` in the body) but not `userXid=42`.
 
-`group_by_keys` is required. An empty list would consume every log record and emit nothing, so it is rejected as a configuration error at startup.
+Attribute values are converted to strings, so numeric and boolean fields work without a `transform` processor (`user.id: 123` groups under `123`).
+
+At least one of `group_by_attributes` or `group_by_keys` is required. With neither, every log record would be consumed and dropped, so it is rejected as a configuration error at startup. An empty key in either list is rejected too.
 
 Logs that don't match any key are silently dropped (or you can split them into a separate pipeline — see [Filtering unmatched logs](#filtering-unmatched-logs)).
 
@@ -98,7 +101,7 @@ The connector reports its own internal counters through the collector's `MeterPr
 |--------|------|------------------|
 | `otelcol_connector_logs_to_spans_logs_ingested` | counter | every log record the connector consumes |
 | `otelcol_connector_logs_to_spans_traces_created` | counter | every group is flushed and a trace is emitted |
-| `otelcol_connector_logs_to_spans_unmatched_dropped` | counter | a log record matches no `group_by_keys` entry and is dropped |
+| `otelcol_connector_logs_to_spans_unmatched_dropped` | counter | a log record matches no `group_by_keys` or `group_by_attributes` entry and is dropped |
 
 `logs_ingested` is the total seen, so `logs_ingested - unmatched_dropped` is the number of records that were grouped, and `traces_created` counts the resulting traces. A rising `unmatched_dropped` means the configured keys do not match the input — see [Key extraction](#key-extraction) and the caveat in [Filtering unmatched logs](#filtering-unmatched-logs).
 
@@ -124,7 +127,8 @@ service:
 | `timeout` | duration | `5s` | **Inactivity timeout.** Resets every time a new log arrives for a group. When no new logs arrive for this long, the group is flushed and converted to a trace. |
 | `max_wait` | duration | `30s` | **Absolute max wait.** Maximum time from the *first* log in a group before it is force-flushed — regardless of ongoing activity. Prevents groups with continuous log streams from never being emitted. |
 | `max_logs_per_trace` | int | `100` | **Max logs per trace.** Maximum number of log records in a single group/trace. When the limit is reached, the current group is flushed early and a new group starts. Set to `0` for no limit. Traces are connected via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links). |
-| `group_by_keys` | string list | **(required)** | Keys to extract from each log body and group by (tried in order). Matched literally, not as regexes. Must contain at least one non-empty key. See [Key extraction](#key-extraction). |
+| `group_by_keys` | string list | `[]` | Keys to extract from each log body and group by (tried in order). Matched literally, not as regexes. At least one of `group_by_keys` or `group_by_attributes` must be set. See [Key extraction](#key-extraction). |
+| `group_by_attributes` | string list | `[]` | Log attribute names to group by (tried in order). Checked **before** `group_by_keys`; attribute values are stringified. Matched literally, not as regexes. See [Key extraction](#key-extraction). |
 | `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
 
@@ -143,6 +147,9 @@ connectors:
       - user
       - userID
       - user_id
+    group_by_attributes:
+      - user.id
+      - enduser.id
     duration_keys:
       - duration
       - time
@@ -165,7 +172,7 @@ service:
 
 ### Filtering unmatched logs
 
-Log records that match no `group_by_keys` entry are always dropped — the connector cannot emit log records, so it has no way to forward them. There is no `unmatched_behaviour` option.
+Log records that match no `group_by_keys` or `group_by_attributes` entry are always dropped — the connector cannot emit log records, so it has no way to forward them. There is no `unmatched_behaviour` option.
 
 If you need to keep unmatched logs, split the stream into two pipelines with the `filterprocessor` before the connector:
 
@@ -199,7 +206,7 @@ service:
 
 ## Grouping non k=v logs
 
-The connector extracts group keys using a `key=value` pattern by default. If your logs use a different format (e.g. space-separated, colon-delimited), you have two options:
+The connector can read the group key from a log attribute (`group_by_attributes`) or from the body (`group_by_keys`). For unstructured text, `group_by_keys` expects `key=value`. If your logs use a different format (e.g. space-separated, colon-delimited), you have two options:
 
 ### Option 1: Transform processor (recommended)
 
@@ -233,11 +240,23 @@ service:
 
 This keeps the connector simple — the transform processor handles all format normalization upstream.
 
-### Option 2: Filelog receiver operators
+### Option 2: Filelog receiver operators (preferred for field extraction)
 
-If you control the filelog receiver config, you can use `regex_parser` to extract structured fields. However, the connector only reads from the log body (not attributes), so the extracted value needs to end up in the body for `group_by_keys` to find it.
+If you control the filelog receiver config, use `regex_parser` (or `json_parser`) to extract the field into a log **attribute** and list it in `group_by_attributes`. The connector reads attributes directly, so the value does not need to be written back into the body and the original log message is preserved:
 
-This is more involved than the transform processor and loses the original log message in the body, so **the transform processor is generally the better choice**.
+```yaml
+receivers:
+  filelog:
+    operators:
+      - type: regex_parser
+        regex: '^user\s+(?P<user_id>\S+)\s+(?P<body>.*)$'
+
+connectors:
+  logs_to_spans:
+    group_by_attributes: [user_id]
+```
+
+This is usually the better choice for structured logs. Option 1 remains useful when the value only exists inside free text that a receiver operator cannot parse reliably.
 
 ## Including in your own collector build
 
@@ -288,7 +307,7 @@ go test -v -race -count=1 ./...
 ```
 
 The test suite covers:
-- Key extraction from structured (Map) and unstructured (string) bodies
+- Key extraction from log attributes, structured (Map) bodies, and unstructured (string) bodies, including attribute-over-body precedence
 - Grouping logs into a single trace
 - Multiple groups producing separate traces
 - Timestamp ordering (regardless of insertion order)
@@ -333,12 +352,13 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Added `group_by_attributes` to read the group key from log attributes instead of the body. Attributes are searched before `group_by_keys`, so structured logs (`filelog` + `json_parser`, or any OTLP-native application) no longer need a `transform` processor to copy the field back into the body. Attribute values are stringified, so numeric and boolean fields work too. At least one of `group_by_attributes` or `group_by_keys` is now required. ([#14](https://github.com/agardnerIT/logs-to-spans-otel/issues/14))
 - Added internal metrics so operators can observe the connector on the collector's own telemetry endpoint: `otelcol_connector_logs_to_spans_logs_ingested`, `otelcol_connector_logs_to_spans_traces_created`, and `otelcol_connector_logs_to_spans_unmatched_dropped`. Unmatched records have always been dropped silently; the counter makes that visible. New [Produced metrics](#produced-metrics) table. ([#1](https://github.com/agardnerIT/logs-to-spans-otel/issues/1))
 - **BREAKING:** removed the `unmatched_behaviour` option. It was declared, defaulted and validated but never read, and `pass_through` was not implementable — the factory registers only `connector.WithLogsToTraces`, so the connector has no logs consumer and cannot emit log records. Users who chose `pass_through` to avoid data loss were getting a silent drop. Unmatched records are dropped by design; split them into a separate pipeline with the `filterprocessor` beforehand (recipe in [Filtering unmatched logs](#filtering-unmatched-logs)). Configs that still set the key now fail to load with `has invalid keys: unmatched_behaviour` — a loud failure instead of a documented no-op.
 - Fixed a stale-timer race that could silently drop records. After a `max_logs_per_trace` split, the retiring group's already-queued timer callback could run late and delete the *replacement* group from the internal map, orphaning its records and breaking the span-link chain. A group is now marked flushed once emitted, a stale callback is a no-op, and a callback only evicts the map entry it still owns. This also removes a duplicate emission from the second of the two timers per group. ([#7](https://github.com/agardnerIT/logs-to-spans-otel/issues/7))
 - Configuration errors are now reported instead of panicking or being silently rewritten ([#9](https://github.com/agardnerIT/logs-to-spans-otel/issues/9), [#16](https://github.com/agardnerIT/logs-to-spans-otel/issues/16)):
   - `group_by_keys` entries are quoted before being compiled into the extraction pattern, so `user.id` matches `user.id=42` literally and no longer also matches `userXid=42`; keys such as `user(` no longer panic at startup
-  - an empty `group_by_keys` is a startup error rather than silently dropping 100% of input
+  - an empty `group_by_keys` with no `group_by_attributes` is a startup error rather than silently dropping 100% of input
 - Fixed the documented install path and the shipped example configs; the filelog timestamp layout is `strptime` `%Y-%m-%d %H:%M:%S`, and expected parse misses no longer log an error per line ([#10](https://github.com/agardnerIT/logs-to-spans-otel/issues/10))
 - CI builds the working tree (via an OCB `replaces:` block) and gates on `go vet` and `go test -race`, instead of validating the published tag and skipping tests ([#18](https://github.com/agardnerIT/logs-to-spans-otel/issues/18))
 - Documented the produced-span schema (resource, scope, span kind, attributes, links) and the resource-attribute grouping caveat

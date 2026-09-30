@@ -257,7 +257,27 @@ func valueToString(v pcommon.Value) string {
 	}
 }
 
+// extractGroupKey returns the value used to group a log record, or "" when
+// nothing matches. Precedence is attribute keys first, then the body:
+//
+//  1. group_by_attributes, in order, matched against the log record's
+//     attributes. Attribute values are converted to string, so numeric and
+//     boolean fields work without a transform processor.
+//  2. group_by_keys against a structured (Map) body, in order.
+//  3. group_by_keys against an unstructured (string) body, as key=value.
+//
+// Attributes win because they are explicit structured fields; the body regexes
+// are a heuristic that can match text the log never intended as a key.
 func (c *logsToSpansConnector) extractGroupKey(lr plog.LogRecord) string {
+	attrs := lr.Attributes()
+	for _, key := range c.config.GroupByAttributes {
+		if val, ok := attrs.Get(key); ok {
+			if s := valueToString(val); s != "" {
+				return s
+			}
+		}
+	}
+
 	if len(c.config.GroupByKeys) == 0 {
 		return ""
 	}

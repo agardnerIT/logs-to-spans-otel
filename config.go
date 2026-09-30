@@ -8,13 +8,25 @@ import (
 )
 
 type Config struct {
-	Timeout         time.Duration `mapstructure:"timeout"`
-	MaxWait         time.Duration `mapstructure:"max_wait"`
-	MaxLogsPerTrace int           `mapstructure:"max_logs_per_trace"`
-	GroupByKeys     []string      `mapstructure:"group_by_keys"`
-	DurationKeys    []string      `mapstructure:"duration_keys"`
-	EndSpanDuration time.Duration `mapstructure:"end_span_duration"`
-	ServiceName     string        `mapstructure:"service_name"`
+	Timeout           time.Duration `mapstructure:"timeout"`
+	MaxWait           time.Duration `mapstructure:"max_wait"`
+	MaxLogsPerTrace   int           `mapstructure:"max_logs_per_trace"`
+	GroupByKeys       []string      `mapstructure:"group_by_keys"`
+	GroupByAttributes []string      `mapstructure:"group_by_attributes"`
+	DurationKeys      []string      `mapstructure:"duration_keys"`
+	EndSpanDuration   time.Duration `mapstructure:"end_span_duration"`
+	ServiceName       string        `mapstructure:"service_name"`
+}
+
+// validateAttributeKeys rejects empty entries in group_by_attributes. An empty
+// key can never match a log attribute and only hides a typo.
+func validateAttributeKeys(keys []string) error {
+	for _, key := range keys {
+		if key == "" {
+			return errors.New("group_by_attributes must not contain an empty key")
+		}
+	}
+	return nil
 }
 
 // groupKeyValuePattern builds the regular expression used to pull "key=value"
@@ -46,10 +58,14 @@ func buildGroupKeyRegexes(keys []string) ([]*regexp.Regexp, error) {
 func (cfg *Config) Validate() error {
 	var errs []error
 
-	if len(cfg.GroupByKeys) == 0 {
+	if len(cfg.GroupByKeys) == 0 && len(cfg.GroupByAttributes) == 0 {
 		errs = append(errs, errors.New(
-			"group_by_keys must contain at least one key: without one every log record is dropped"))
+			"at least one of group_by_keys or group_by_attributes must be set: without one every log record is dropped"))
 	} else if _, err := buildGroupKeyRegexes(cfg.GroupByKeys); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := validateAttributeKeys(cfg.GroupByAttributes); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -74,12 +90,13 @@ func (cfg *Config) Validate() error {
 
 func createDefaultConfig() *Config {
 	return &Config{
-		Timeout:         5 * time.Second,
-		MaxWait:         30 * time.Second,
-		MaxLogsPerTrace: 100,
-		GroupByKeys:     []string{},
-		DurationKeys:    []string{},
-		EndSpanDuration: 500 * time.Millisecond,
-		ServiceName:     "logs-to-spans",
+		Timeout:           5 * time.Second,
+		MaxWait:           30 * time.Second,
+		MaxLogsPerTrace:   100,
+		GroupByKeys:       []string{},
+		GroupByAttributes: []string{},
+		DurationKeys:      []string{},
+		EndSpanDuration:   500 * time.Millisecond,
+		ServiceName:       "logs-to-spans",
 	}
 }

@@ -79,6 +79,7 @@ func TestConfigDefaults(t *testing.T) {
 	assert.Equal(t, "logs-to-spans", cfg.ServiceName)
 	assert.Equal(t, 30*time.Second, cfg.MaxWait)
 	assert.Empty(t, cfg.GroupByKeys)
+	assert.Empty(t, cfg.GroupByAttributes)
 }
 
 func TestExtractGroupKey_Unstructured(t *testing.T) {
@@ -126,6 +127,154 @@ func TestExtractGroupKey_Structured(t *testing.T) {
 
 	got := conn.(*logsToSpansConnector).extractGroupKey(lr)
 	assert.Equal(t, "123", got)
+}
+
+func TestExtractGroupKey_FromAttributes(t *testing.T) {
+	tests := []struct {
+		name     string
+		attrs    map[string]string
+		attrKeys []string
+		expected string
+	}{
+		{
+			name:     "single attribute",
+			attrs:    map[string]string{"user.id": "123"},
+			attrKeys: []string{"user.id"},
+			expected: "123",
+		},
+		{
+			name:     "searched in order",
+			attrs:    map[string]string{"enduser.id": "abc"},
+			attrKeys: []string{"user.id", "enduser.id"},
+			expected: "abc",
+		},
+		{
+			name:     "first match wins",
+			attrs:    map[string]string{"user.id": "first", "enduser.id": "second"},
+			attrKeys: []string{"user.id", "enduser.id"},
+			expected: "first",
+		},
+		{
+			name:     "no attribute match",
+			attrs:    map[string]string{"other": "x"},
+			attrKeys: []string{"user.id"},
+			expected: "",
+		},
+		{
+			name:     "empty attribute value is skipped",
+			attrs:    map[string]string{"user.id": "", "enduser.id": "abc"},
+			attrKeys: []string{"user.id", "enduser.id"},
+			expected: "abc",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sink := newTestSink()
+			cfg := createDefaultConfig()
+			cfg.GroupByAttributes = tt.attrKeys
+			conn := createTestConnector(t, cfg, sink)
+
+			lr := newLogRecordWithAttrs("plain unstructured message", time.Now(), "INFO", tt.attrs)
+			got := conn.(*logsToSpansConnector).extractGroupKey(lr)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestExtractGroupKey_AttributesTakePrecedenceOverBody(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"userID"}
+	cfg.GroupByAttributes = []string{"user.id"}
+	conn := createTestConnector(t, cfg, sink)
+
+	lr := newLogRecordWithAttrs("userID=body-value", time.Now(), "INFO",
+		map[string]string{"user.id": "attr-value"})
+	got := conn.(*logsToSpansConnector).extractGroupKey(lr)
+	assert.Equal(t, "attr-value", got)
+}
+
+func TestExtractGroupKey_AttributesPrecedenceOverStructuredBody(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	cfg.GroupByAttributes = []string{"user.id"}
+	conn := createTestConnector(t, cfg, sink)
+
+	logs := plog.NewLogs()
+	rl := logs.ResourceLogs().AppendEmpty()
+	sl := rl.ScopeLogs().AppendEmpty()
+	lr := sl.LogRecords().AppendEmpty()
+	lr.Body().SetEmptyMap().PutStr("user", "body-value")
+	lr.Attributes().PutStr("user.id", "attr-value")
+	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+
+	got := conn.(*logsToSpansConnector).extractGroupKey(lr)
+	assert.Equal(t, "attr-value", got)
+}
+
+func TestExtractGroupKey_FallsBackToBodyWhenAttributeMissing(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"userID"}
+	cfg.GroupByAttributes = []string{"user.id"}
+	conn := createTestConnector(t, cfg, sink)
+
+	lr := newLogRecord("userID=body-value", time.Now(), "INFO")
+	got := conn.(*logsToSpansConnector).extractGroupKey(lr)
+	assert.Equal(t, "body-value", got)
+}
+
+func TestExtractGroupKey_NonStringAttribute(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByAttributes = []string{"user.id"}
+	conn := createTestConnector(t, cfg, sink)
+
+	logs := plog.NewLogs()
+	rl := logs.ResourceLogs().AppendEmpty()
+	sl := rl.ScopeLogs().AppendEmpty()
+	lr := sl.LogRecords().AppendEmpty()
+	lr.Body().SetStr("no key in the body")
+	lr.Attributes().PutInt("user.id", 123)
+	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+
+	got := conn.(*logsToSpansConnector).extractGroupKey(lr)
+	assert.Equal(t, "123", got)
+}
+
+func TestAttributesOnlyConfigProducesTraces(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.GroupByAttributes = []string{"user.id"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Now()
+	r1 := newLogRecordWithAttrs("first", now, "INFO", map[string]string{"user.id": "123"})
+	r2 := newLogRecordWithAttrs("second", now.Add(time.Second), "INFO", map[string]string{"user.id": "123"})
+	r3 := newLogRecordWithAttrs("other group", now, "INFO", map[string]string{"user.id": "456"})
+	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3})
+
+	time.Sleep(200 * time.Millisecond)
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2, "one trace per distinct attribute value")
+
+	var spans int
+	keys := map[string]bool{}
+	for _, td := range traces {
+		ss := td.ResourceSpans().At(0).ScopeSpans().At(0)
+		spans += ss.Spans().Len()
+		for i := 0; i < ss.Spans().Len(); i++ {
+			v, ok := ss.Spans().At(i).Attributes().Get("group.key")
+			require.True(t, ok)
+			keys[v.Str()] = true
+		}
+	}
+	assert.Equal(t, 3, spans)
+	assert.True(t, keys["123"], "123 group present")
+	assert.True(t, keys["456"], "456 group present")
 }
 
 func TestExtractGroupKey_StructuredNoMatch(t *testing.T) {
@@ -311,7 +460,7 @@ func TestEmptyGroupByKeys(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	traces := sink.AllTraces()
-	assert.Empty(t, traces, "no traces should be produced with empty group_by_keys")
+	assert.Empty(t, traces, "no traces should be produced without any group-by keys")
 }
 
 func TestSeverityAttribute(t *testing.T) {
@@ -715,11 +864,42 @@ func TestConfigValidateEmptyServiceName(t *testing.T) {
 	assert.Empty(t, cfg.ServiceName, "Validate must not rewrite the value")
 }
 
-func TestConfigValidateRejectsEmptyGroupByKeys(t *testing.T) {
+func TestConfigValidateRejectsNoGroupByKeysOrAttributes(t *testing.T) {
 	cfg := createDefaultConfig()
 	err := cfg.Validate()
-	require.Error(t, err, "empty group_by_keys silently drops every record and must be rejected")
-	assert.Contains(t, err.Error(), "group_by_keys")
+	require.Error(t, err, "with no group_by_keys and no group_by_attributes every record is dropped and the config must be rejected")
+	assert.Contains(t, err.Error(), "group_by_keys or group_by_attributes")
+}
+
+func TestConfigValidateAcceptsAttributesOnly(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.GroupByAttributes = []string{"user.id", "enduser.id"}
+	require.NoError(t, cfg.Validate(), "group_by_attributes alone must be a valid config")
+}
+
+func TestConfigValidateAcceptsBodyAndAttributes(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.GroupByAttributes = []string{"user.id"}
+	require.NoError(t, cfg.Validate())
+}
+
+func TestConfigValidateRejectsEmptyAttributeKey(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.GroupByAttributes = []string{"user.id", ""}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group_by_attributes")
+}
+
+func TestFactoryAcceptsAttributesOnlyConfig(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.GroupByAttributes = []string{"user.id"}
+	factory := NewFactory()
+
+	conn, err := factory.CreateLogsToTraces(context.Background(), newTestSettings(), cfg, newTestSink())
+	require.NoError(t, err)
+	assert.Empty(t, conn.(*logsToSpansConnector).compiledRegex,
+		"attribute-only configs compile no body regexes")
 }
 
 func TestConfigValidateRejectsEmptyGroupByKeyEntry(t *testing.T) {
