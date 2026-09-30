@@ -2,6 +2,8 @@ package logs_to_spans
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -1535,4 +1537,136 @@ func TestMaxLogsPerTraceWithTimeout(t *testing.T) {
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1, "timeout should flush the group")
 	assert.Equal(t, 2, traces[0].SpanCount())
+}
+
+// TestStaleTimerCallbackDoesNotEvictReplacementGroup covers issue #7. When
+// max_logs_per_trace splits a group, the outgoing group's timer may already
+// have fired and queued its callback. That callback must neither delete the
+// replacement group nor re-emit the records the split already delivered.
+func TestStaleTimerCallbackDoesNotEvictReplacementGroup(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 2
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+
+	// First record opens group g1.
+	c.addToGroup("user=123", newLogRecord("user=123 log1", now, "INFO"))
+
+	c.mu.Lock()
+	g1 := c.groups["user=123"]
+	c.mu.Unlock()
+	require.NotNil(t, g1)
+
+	// Second record hits the limit: g1 is retired and replaced by g2. g1's
+	// timer callback may still be queued at this point.
+	c.addToGroup("user=123", newLogRecord("user=123 log2", now.Add(1*time.Second), "INFO"))
+
+	c.mu.Lock()
+	g2 := c.groups["user=123"]
+	c.mu.Unlock()
+	require.NotNil(t, g2)
+	require.NotSame(t, g1, g2, "max_logs_per_trace should have replaced the group")
+
+	// The stale callback for g1 runs late.
+	c.flushGroup("user=123", g1)
+
+	c.mu.Lock()
+	current := c.groups["user=123"]
+	c.mu.Unlock()
+	assert.Same(t, g2, current, "stale callback must not evict the live group")
+
+	// The split already emitted g1's records. The stale callback must not emit
+	// them a second time.
+	require.Len(t, sink.AllTraces(), 1)
+	assert.Equal(t, 2, sink.AllTraces()[0].SpanCount())
+
+	// g2 keeps collecting, and its trace links back to the split trace.
+	c.addToGroup("user=123", newLogRecord("user=123 log3", now.Add(2*time.Second), "INFO"))
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2, "records held by g2 must not be lost")
+	assert.Equal(t, 1, traces[1].SpanCount())
+
+	firstSpan := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	secondSpan := traces[1].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	require.Equal(t, 1, secondSpan.Links().Len(), "span-link chain must survive the split")
+	assert.Equal(t, firstSpan.TraceID(), secondSpan.Links().At(0).TraceID())
+}
+
+// TestFlushGroupIsIdempotent covers the second timer of an already-flushed
+// group. Both timer and maxTimer point at the same group, so whichever fires
+// second must be a no-op rather than emitting a duplicate trace.
+func TestFlushGroupIsIdempotent(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	c.addToGroup("user=123", newLogRecord("user=123 only", time.Now(), "INFO"))
+
+	c.mu.Lock()
+	g := c.groups["user=123"]
+	c.mu.Unlock()
+	require.NotNil(t, g)
+
+	c.flushGroup("user=123", g)
+	c.flushGroup("user=123", g)
+
+	require.Len(t, sink.AllTraces(), 1, "group must be emitted exactly once")
+	assert.Equal(t, 1, sink.AllTraces()[0].SpanCount())
+
+	c.mu.Lock()
+	_, ok := c.groups["user=123"]
+	c.mu.Unlock()
+	assert.False(t, ok, "flushed group must be removed from the map")
+}
+
+// TestConcurrentSplitAndFlush exercises the map mutations and timer callbacks
+// under -race, and asserts every record is emitted exactly once.
+func TestConcurrentSplitAndFlush(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = time.Millisecond
+	cfg.MaxWait = time.Millisecond
+	cfg.MaxLogsPerTrace = 3
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	const goroutines = 8
+	const perGoroutine = 100
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				ld := plog.NewLogs()
+				sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+				lr := sl.LogRecords().AppendEmpty()
+				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+				lr.Body().SetStr(fmt.Sprintf("user=%d log%d", id%4, i))
+				_ = conn.ConsumeLogs(context.Background(), ld)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	seen := 0
+	for _, td := range sink.AllTraces() {
+		seen += td.SpanCount()
+	}
+	assert.Equal(t, goroutines*perGoroutine, seen, "no record may be dropped or duplicated")
 }

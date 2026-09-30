@@ -35,6 +35,11 @@ type logGroup struct {
 	prevSpanID  pcommon.SpanID
 	traceID     pcommon.TraceID
 	lastSpanID  pcommon.SpanID
+	// flushed guards against a group being emitted twice. time.Timer.Stop()
+	// returns false when the callback has already fired and is queued, so a
+	// stale callback can still run after the group has left the map. It also
+	// stops that callback evicting the replacement group under the same key.
+	flushed bool
 }
 
 type logRecord struct {
@@ -129,13 +134,21 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		flushedRecords := group.records
 		flushedPrevTraceID := group.prevTraceID
 		flushedPrevSpanID := group.prevSpanID
-		delete(c.groups, key)
+
+		// Retire the outgoing group before it leaves the map. Its timers may
+		// already have fired and queued a callback, and Stop() returning false
+		// is not enough on its own: mark the group flushed so a queued callback
+		// becomes a no-op instead of re-emitting these records or deleting the
+		// replacement group installed below.
+		group.flushed = true
 		if group.maxTimer != nil {
 			group.maxTimer.Stop()
 		}
 		if group.timer != nil {
 			group.timer.Stop()
 		}
+		delete(c.groups, key)
+		group.records = nil
 
 		newGroup := &logGroup{key: key}
 		newGroup.prevTraceID = traceID
@@ -164,16 +177,26 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 
 func (c *logsToSpansConnector) flushGroup(key string, group *logGroup) {
 	c.mu.Lock()
-	if c.stopped {
+	if c.stopped || group.flushed {
 		c.mu.Unlock()
 		return
 	}
-	delete(c.groups, key)
+	group.flushed = true
+
+	// Stop this group's own timers before touching the map. Both timer and
+	// maxTimer point at this group, so whichever fires second must find it
+	// already flushed and do nothing.
 	if group.maxTimer != nil {
 		group.maxTimer.Stop()
 	}
 	if group.timer != nil {
 		group.timer.Stop()
+	}
+
+	// Only the group that still owns the key may evict it. A callback from a
+	// group replaced by max_logs_per_trace must not delete the replacement.
+	if current, ok := c.groups[key]; ok && current == group {
+		delete(c.groups, key)
 	}
 	c.mu.Unlock()
 	c.processGroup(context.Background(), group)
