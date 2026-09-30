@@ -411,12 +411,38 @@ PHASE 4 - FEATURES (in value order)
     metadata.yaml tests.config and testdata/config.yaml set the new keys.
 
 
-[10] #3  Configurable span naming instead of full log body
+[10] #3  DONE - issue closed. Commit pending.
+         Configurable span naming instead of full log body
          https://github.com/agardnerIT/logs-to-spans-otel/issues/3
 
-    Already scoped on the issue (span_name_template with {body} / {severity}
-    / {truncated:N} ). Currently the span name is the entire log body - high
-    cardinality and potentially multi-KB. Independent of everything else.
+    Outcome: new `span_name_template` option (default `{body}`, unchanged
+    behaviour). Placeholders `{body}`, `{severity}` and `{truncated:N:body}`
+    (first N characters, counted in runes so a multi-byte character is never
+    split); everything else is literal text. A new span_name.go parses the
+    template once (in Validate and in the factory, the same two places the
+    group_by_keys regexes are compiled) and renders it per record; an unknown
+    or malformed placeholder is a startup error rather than a silent literal.
+    A template that renders empty, e.g. `{severity}` on a record with no
+    severity, falls back to the full body because OpenTelemetry requires a
+    non-empty span name.
+
+    Decision - small template, not OTTL. OTTL would pull the transform
+    machinery into the connector for the few fields a span name can use, and
+    the transform processor can already rewrite the body upstream.
+
+    Tests: 12 new in span_name_test.go - parser accept/reject table, rune
+    truncation, default/body, severity prefix, truncation, literal, empty-render
+    fallback, Validate rejection (invalid and empty), factory rejection after
+    Validate is bypassed, and the factory defaulting an absent template.
+    go vet + go test -race clean.
+
+    Docs: README "Span naming" section + reference row + Produced spans row +
+    example + Unreleased changelog; config.schema.yaml regenerated with
+    schemagen; testdata/config.yaml all_options and metadata.yaml tests.config
+    set the new key; collector.yaml shows `{truncated:120:body}`.
+
+    No longer deferred: the full-body name was the last known high-cardinality
+    output wart. #15 is the remaining optional Phase 4 item.
 
 
 [11] #15  Move log record extraction out of the global mutex
@@ -502,16 +528,15 @@ PHASE 5 - DONATION
 IF YOU WANT TO MOVE FAST
 ========================
 
-A credible donation does not need all 13. Ship this set and defer #13, #3,
-#15:
+A credible donation does not need all 13. Ship this set and defer #15:
 
     #10 (DONE) -> #9 + #16 (DONE) -> #7 (DONE) -> #8 (DONE) -> #1 (DONE)
-    -> #14 (DONE) -> #11 (DONE) -> #17
+    -> #14 (DONE) -> #11 (DONE) -> #12 (DONE) -> #13 (DONE) -> #3 (DONE) -> #17
 
-    Both phases 1-3 are closed and five of the seven Phase 4 issues are done
-    (#1, #14, #11, #12, #13). #17's code side is now done (see [12]); the
+    Both phases 1-3 are closed and six of the seven Phase 4 issues are done
+    (#1, #14, #11, #12, #13, #3). #17's code side is done (see [12]); the
     remaining work is the module/directory move at donation plus the
-    sponsor/codeowners. Optionally #3/#15 if the donation has to wait.
+    sponsor/codeowners. Optionally #15 if the donation has to wait.
 
 #11 is deliberately included rather than deferred - it is the one a reviewer
 will raise on the first pass.
