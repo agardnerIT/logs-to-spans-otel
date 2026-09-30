@@ -81,9 +81,27 @@ The group key can come from a log **attribute** or from the log **body**. The co
 
 Attribute values are converted to strings, so numeric and boolean fields work without a `transform` processor (`user.id: 123` groups under `123`).
 
-At least one of `group_by_attributes` or `group_by_keys` is required. With neither, every log record would be consumed and dropped, so it is rejected as a configuration error at startup. An empty key in either list is rejected too.
+At least one of `group_by_attributes` or `group_by_keys` is required. With neither, every log record would be consumed and dropped, so it is rejected as a configuration error at startup. An empty key in any of the grouping lists is rejected too.
 
 Logs that don't match any key are silently dropped (or you can split them into a separate pipeline — see [Filtering unmatched logs](#filtering-unmatched-logs)).
+
+### Scoping groups by resource
+
+By default grouping looks only at the extracted key, so the same value from two different sources merges into one trace. Set `group_by_resource_attributes` to the resource attribute names that identify a source — `service.name`, `k8s.pod.name`, `service.instance.id`, and so on — and records whose resource differs in any of those attributes form separate groups and therefore separate traces.
+
+`group_by_resource_attributes` is an **additional dimension**, not a replacement: `group_by_keys` or `group_by_attributes` must still match for a record to be grouped. The value reported as `group.key` is always the extracted value, never the resource scope.
+
+A resource that is missing one of the configured attributes contributes an empty value, so resources that are missing the *same* attribute collapse together. This is a scope, not a filter: a record is never dropped because its resource lacks an attribute.
+
+Source resource attributes are copied onto the emitted trace's resource when `copy_resource_attributes` is `true` (the default). When a group holds records from more than one resource — possible only when the resources do not differ in any `group_by_resource_attributes` — the **first** record's resource wins and later records' resource attributes are ignored for that group. Set `copy_resource_attributes: false` to emit only `service.name`.
+
+`service.name` precedence, highest first:
+
+1. an explicit `service_name` in the connector config;
+2. the source `service.name`, when `copy_resource_attributes` is `true` and the source has one;
+3. `logs-to-spans`.
+
+So `service_name` is an override, not a default: leaving it unset preserves the source identity rather than replacing it, and every emitted trace still has a `service.name`.
 
 ### Duration extraction
 
@@ -97,7 +115,7 @@ Each flushed group becomes one `ResourceSpans` batch:
 
 | Element | Value |
 |---------|-------|
-| Resource attribute | `service.name` = `service_name` |
+| Resource attributes | The source `ResourceLogs` resource attributes, copied when `copy_resource_attributes` is `true` (the default). When a group holds records from more than one resource, the **first** record's resource is used. `service.name` precedence: an explicit `service_name` wins; otherwise the source `service.name` is preserved; otherwise `logs-to-spans`. See [Scoping groups by resource](#scoping-groups-by-resource). |
 | Scope name | `logs-to-spans` |
 | Trace ID | random, generated when the group is flushed. A group split by `max_logs_per_trace` gets its own trace ID and is linked back to the previous one. |
 | Span name | the full log body. High cardinality by nature — configurable naming is tracked in [#3](https://github.com/agardnerIT/logs-to-spans-otel/issues/3). |
@@ -110,7 +128,7 @@ Each flushed group becomes one `ResourceSpans` batch:
 
 Spans are sorted by start timestamp before emission, regardless of the order the logs arrived in.
 
-> **Caveat — grouping ignores resource attributes.** Two different pods that log the same extracted value (say `userID=123`) merge into a single trace. Preserving resource attributes and scoping the group key by resource is tracked in [#12](https://github.com/agardnerIT/logs-to-spans-otel/issues/12).
+> **Grouping collapses resources unless you scope it.** By default two pods that log the same extracted value (say `userID=123`) merge into a single trace, and only the first record's resource is kept. Set [`group_by_resource_attributes`](#scoping-groups-by-resource) to keep them apart.
 
 > **`max_groups` eviction flushes a group before its timeout.** The records are still emitted as a trace, exactly once; only the trace boundary moves. See [Bounding memory with `max_groups`](#bounding-memory-with-max_groups).
 
@@ -150,13 +168,15 @@ service:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `service_name` | string | `"logs-to-spans"` | Value of the `service.name` resource attribute on produced spans. |
+| `service_name` | string | `""` | Overrides the `service.name` resource attribute on produced spans. Empty (the default) preserves the source `service.name`, falling back to `logs-to-spans` when the source has none. See [Scoping groups by resource](#scoping-groups-by-resource). |
+| `copy_resource_attributes` | bool | `true` | Copy the source logs' resource attributes onto the resource of every emitted trace. When a group holds records from more than one resource, the first record's resource is used. Set to `false` to emit only `service.name`. |
 | `timeout` | duration | `5s` | **Inactivity timeout.** Resets every time a new log arrives for a group. When no new logs arrive for this long, the group is flushed and converted to a trace. |
 | `max_wait` | duration | `30s` | **Absolute max wait.** Maximum time from the *first* log in a group before it is force-flushed — regardless of ongoing activity. Prevents groups with continuous log streams from never being emitted. |
 | `max_logs_per_trace` | int | `100` | **Max logs per trace.** Maximum number of log records in a single group/trace. When the limit is reached, the current group is flushed early and a new group starts. Set to `0` for no limit. Traces are connected via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links). |
 | `max_groups` | int | `1000` | **Max concurrent groups.** Hard cap on the number of buffered groups. When opening a new group would exceed it, the least recently updated group is flushed early and emitted as a trace before the new group is admitted. Set to `0` for no limit. See [Bounding memory with `max_groups`](#bounding-memory-with-max_groups). |
 | `group_by_keys` | string list | `[]` | Keys to extract from each log body and group by (tried in order). Matched literally, not as regexes. At least one of `group_by_keys` or `group_by_attributes` must be set. See [Key extraction](#key-extraction). |
 | `group_by_attributes` | string list | `[]` | Log attribute names to group by (tried in order). Checked **before** `group_by_keys`; attribute values are stringified. Matched literally, not as regexes. See [Key extraction](#key-extraction). |
+| `group_by_resource_attributes` | string list | `[]` | Resource attribute names that scope a group, so the same key from different sources forms separate traces. Missing attributes contribute an empty value. See [Scoping groups by resource](#scoping-groups-by-resource). |
 | `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
 
@@ -191,11 +211,15 @@ connectors:
     group_by_attributes:
       - user.id
       - enduser.id
+    group_by_resource_attributes:
+      - service.name
+      - k8s.pod.name
     duration_keys:
       - duration
       - time
       - time-spent
     end_span_duration: 500ms
+    copy_resource_attributes: true
 ```
 
 ### Pipeline wiring
@@ -357,6 +381,7 @@ The test suite covers:
 - Service name propagation
 - `max_logs_per_trace` limit, span links, and chain behaviour
 - Stale-timer safety after a `max_logs_per_trace` split, and flush idempotency
+- Source resource attribute copying, `group_by_resource_attributes` scoping, and `service.name` precedence across multiple resources
 - Unmatched records being dropped without creating a trace
 - Concurrent consumption during splits and timer callbacks (run under `-race`)
 
@@ -405,6 +430,10 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Source resource attributes are now preserved and can scope grouping ([#12](https://github.com/agardnerIT/logs-to-spans-otel/issues/12)):
+  - New `copy_resource_attributes` (default `true`) copies the source logs' resource attributes (`host.name`, `k8s.pod.name`, `service.instance.id`, ...) onto the resource of every emitted trace. Previously only `service.name` was written and all other resource context was discarded. When a group holds records from more than one resource, the first record's resource wins — the previously silent collapsing is now documented.
+  - New `group_by_resource_attributes` (default empty) scopes a group by resource attribute values, so the same extracted key from different pods or services no longer merges into one trace. It is an additional dimension: `group_by_keys` / `group_by_attributes` must still match. `group.key` remains the extracted value.
+  - `service_name` is now an **override** and defaults to empty. Empty preserves the source `service.name` and falls back to `logs-to-spans` only when the source has none. This is a behaviour change: previously the connector always wrote the configured `service_name` (default `logs-to-spans`), overwriting the source value.
 - Donation-readiness groundwork for [#17](https://github.com/agardnerIT/logs-to-spans-otel/issues/17): added `metadata.yaml`, `doc.go`, `config.schema.yaml`, generated `documentation.md`, the generated `internal/metadata` and `internal/metadatatest` packages, `generated_component_test.go`, a `generated_package_test.go` that runs the suite under `go.uber.org/goleak`, and the `Copyright The OpenTelemetry Authors` / `SPDX-License-Identifier: Apache-2.0` header on every Go file. Internal metrics are now built by the mdatagen-generated `TelemetryBuilder` from `metadata.yaml`. Metric names, types and values are unchanged; their HELP text now carries the `[Development]` stability suffix, and the `active_groups` gauge callback is unregistered on shutdown. Collector dependencies realigned with contrib `main` (`go 1.26.0`, collector `v1.68.0` / `v0.162.0`); `builder-config.yaml` and CI follow. The module path and on-disk directory rename to `connector/logstospansconnector` are deliberately deferred to the donation pull request.
 - Added `max_groups` (default `1000`, `0` disables) to bound the number of concurrent groups. Previously only `max_logs_per_trace` bounded each group; nothing bounded how many existed, so a high-cardinality key created one map entry and two live timers per distinct value until it timed out. When the cap is reached the **least recently updated** group is flushed early and emitted as a trace before the new group is admitted — no records are lost, but the trace boundary moves. Two internal metrics make the cap observable: `otelcol_connector_logs_to_spans_groups_evicted` (counter) and `otelcol_connector_logs_to_spans_active_groups` (gauge). There is no separate TTL option because `max_wait` already bounds a group's absolute lifetime. ([#11](https://github.com/agardnerIT/logs-to-spans-otel/issues/11))
 - Added `group_by_attributes` to read the group key from log attributes instead of the body. Attributes are searched before `group_by_keys`, so structured logs (`filelog` + `json_parser`, or any OTLP-native application) no longer need a `transform` processor to copy the field back into the body. Attribute values are stringified, so numeric and boolean fields work too. At least one of `group_by_attributes` or `group_by_keys` is now required. ([#14](https://github.com/agardnerIT/logs-to-spans-otel/issues/14))

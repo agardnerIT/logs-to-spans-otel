@@ -20,6 +20,15 @@ all_options:
   max_groups: 1000
   group_by_keys: [userID, user_id]
   group_by_attributes: [user.id]
+  group_by_resource_attributes: [service.name, k8s.pod.name]
   duration_keys: [duration]
   end_span_duration: 500ms
+  copy_resource_attributes: true
   service_name: my-app
+
+# Scope groups per source so the same key from different pods/services does not
+# merge into one trace, and preserve the source resource attributes.
+resource_scoped:
+  group_by_attributes: [user.id]
+  group_by_resource_attributes: [service.name, k8s.pod.name]
+  copy_resource_attributes: true

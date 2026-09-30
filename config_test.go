@@ -18,7 +18,7 @@ func TestConfigFromTestdata(t *testing.T) {
 	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
 
-	for _, name := range []string{"default", "attributes_only", "all_options"} {
+	for _, name := range []string{"default", "attributes_only", "all_options", "resource_scoped"} {
 		t.Run(name, func(t *testing.T) {
 			sub, err := cm.Sub(name)
 			require.NoError(t, err)

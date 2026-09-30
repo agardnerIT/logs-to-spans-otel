@@ -8,6 +8,8 @@ import (
 	"crypto/rand"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,7 +35,12 @@ type logsToSpansConnector struct {
 }
 
 type logGroup struct {
-	key         string
+	key string
+	// resource is a deep copy of the source resource attributes of the first
+	// record in the group, taken while the upstream pdata is still valid. It is
+	// copied onto the emitted trace's resource when copy_resource_attributes is
+	// enabled.
+	resource    pcommon.Map
 	records     []*logRecord
 	timer       *time.Timer
 	maxTimer    *time.Timer
@@ -80,6 +87,7 @@ func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) er
 		rl := ld.ResourceLogs().At(i)
 		for j := 0; j < rl.ScopeLogs().Len(); j++ {
 			sl := rl.ScopeLogs().At(j)
+			resource := rl.Resource().Attributes()
 			for k := 0; k < sl.LogRecords().Len(); k++ {
 				lr := sl.LogRecords().At(k)
 				c.telemetry.ConnectorLogsToSpansLogsIngested.Add(ctx, 1)
@@ -88,7 +96,7 @@ func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) er
 					c.telemetry.ConnectorLogsToSpansUnmatchedDropped.Add(ctx, 1)
 					continue
 				}
-				c.addToGroup(key, lr)
+				c.addToGroup(key, resource, lr)
 			}
 		}
 	}
@@ -126,7 +134,7 @@ func (c *logsToSpansConnector) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
+func (c *logsToSpansConnector) addToGroup(key string, resource pcommon.Map, lr plog.LogRecord) {
 	c.mu.Lock()
 
 	if c.stopped {
@@ -134,7 +142,13 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		return
 	}
 
-	group, exists := c.groups[key]
+	// The map key is the extracted key, optionally extended with the configured
+	// resource attribute values, so the same key from different sources lands in
+	// different groups. The extracted key is kept separately for the group.key
+	// span attribute and for logging.
+	mapKey := c.buildMapKey(key, resource)
+
+	group, exists := c.groups[mapKey]
 	var evicted *logGroup
 	if !exists {
 		// Bound the number of live groups. A high-cardinality key (a request or
@@ -143,10 +157,10 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		if c.config.MaxGroups > 0 && len(c.groups) >= c.config.MaxGroups {
 			evicted = c.evictLeastRecentlyUpdatedLocked()
 		}
-		group = &logGroup{key: key}
-		c.groups[key] = group
+		group = &logGroup{key: key, resource: copyResourceAttributes(resource)}
+		c.groups[mapKey] = group
 		group.maxTimer = time.AfterFunc(c.config.MaxWait, func() {
-			c.flushGroup(key, group)
+			c.flushGroup(mapKey, group)
 		})
 	}
 
@@ -157,7 +171,7 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		group.timer.Stop()
 	}
 	group.timer = time.AfterFunc(c.config.Timeout, func() {
-		c.flushGroup(key, group)
+		c.flushGroup(mapKey, group)
 	})
 
 	if c.config.MaxLogsPerTrace > 0 && len(group.records) >= c.config.MaxLogsPerTrace {
@@ -179,23 +193,26 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		if group.timer != nil {
 			group.timer.Stop()
 		}
-		delete(c.groups, key)
+		delete(c.groups, mapKey)
 		group.records = nil
 
-		newGroup := &logGroup{key: key}
+		// The replacement inherits the group's resource: a split must not change
+		// the resource of the records that follow.
+		newGroup := &logGroup{key: key, resource: group.resource}
 		newGroup.lastUpdated = time.Now()
 		newGroup.prevTraceID = traceID
 		newGroup.prevSpanID = lastSpanID
-		c.groups[key] = newGroup
+		c.groups[mapKey] = newGroup
 		newGroup.maxTimer = time.AfterFunc(c.config.MaxWait, func() {
-			c.flushGroup(key, newGroup)
+			c.flushGroup(mapKey, newGroup)
 		})
 		newGroup.timer = time.AfterFunc(c.config.Timeout, func() {
-			c.flushGroup(key, newGroup)
+			c.flushGroup(mapKey, newGroup)
 		})
 		c.mu.Unlock()
 		c.processGroup(context.Background(), &logGroup{
 			key:         key,
+			resource:    group.resource,
 			records:     flushedRecords,
 			prevTraceID: flushedPrevTraceID,
 			prevSpanID:  flushedPrevSpanID,
@@ -338,6 +355,46 @@ func valueToString(v pcommon.Value) string {
 	}
 }
 
+// copyResourceAttributes deep-copies a source resource attribute set. The
+// result is safe to keep after ConsumeLogs returns; the upstream pdata it came
+// from is not (the connector declares Capabilities{MutatesData: false}).
+func copyResourceAttributes(resource pcommon.Map) pcommon.Map {
+	out := pcommon.NewMap()
+	resource.CopyTo(out)
+	return out
+}
+
+// buildMapKey returns the key used in the internal groups map. Without
+// group_by_resource_attributes it is exactly the extracted key. With it, the
+// configured resource attribute values are appended so the same extracted
+// value from different sources forms separate groups. Every component is
+// length-prefixed, so distinct scopes can never collide, even when a value
+// contains the separator character. A resource that is missing one of the
+// configured attributes contributes an empty component and therefore collapses
+// with other resources that are also missing it.
+func (c *logsToSpansConnector) buildMapKey(key string, resource pcommon.Map) string {
+	if len(c.config.GroupByResourceAttributes) == 0 {
+		return key
+	}
+
+	var b strings.Builder
+	appendComponent := func(s string) {
+		b.WriteString(strconv.Itoa(len(s)))
+		b.WriteByte(':')
+		b.WriteString(s)
+	}
+
+	appendComponent(key)
+	for _, name := range c.config.GroupByResourceAttributes {
+		value := ""
+		if v, ok := resource.Get(name); ok {
+			value = valueToString(v)
+		}
+		appendComponent(value)
+	}
+	return b.String()
+}
+
 // extractGroupKey returns the value used to group a log record, or "" when
 // nothing matches. Precedence is attribute keys first, then the body:
 //
@@ -406,7 +463,23 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
-	rs.Resource().Attributes().PutStr("service.name", c.config.ServiceName)
+	attrs := rs.Resource().Attributes()
+	if c.config.CopyResourceAttributes {
+		group.resource.CopyTo(attrs)
+	}
+	// service.name precedence: an explicit service_name always wins; otherwise
+	// the source service.name is preserved, and defaultServiceName is used only
+	// when the source has none. This keeps the connector from inventing an
+	// identity over a real one, while still guaranteeing every trace has a
+	// service.name.
+	switch {
+	case c.config.ServiceName != "":
+		attrs.PutStr("service.name", c.config.ServiceName)
+	default:
+		if v, ok := attrs.Get("service.name"); !ok || v.Str() == "" {
+			attrs.PutStr("service.name", defaultServiceName)
+		}
+	}
 	ss := rs.ScopeSpans().AppendEmpty()
 	ss.Scope().SetName("logs-to-spans")
 

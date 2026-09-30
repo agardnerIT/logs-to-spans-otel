@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// defaultServiceName is written to the output resource when the connector is
+// not configured with an explicit service_name and the source logs do not
+// carry one either. It guarantees every emitted trace has a service.name.
+const defaultServiceName = "logs-to-spans"
+
 // Config defines the configuration for the logs_to_spans connector.
 type Config struct {
 	// Timeout is the inactivity period after which a group is flushed. Each new
@@ -39,6 +44,13 @@ type Config struct {
 	// group key. Attribute matches take precedence over GroupByKeys.
 	GroupByAttributes []string `mapstructure:"group_by_attributes"`
 
+	// GroupByResourceAttributes is the ordered list of resource attribute names
+	// that scope the group. Records whose resource differs in any of these
+	// attributes form separate groups and therefore separate traces. It is an
+	// additional scoping dimension: the extracted group key is still required.
+	// With an empty list, resource attributes do not affect grouping.
+	GroupByResourceAttributes []string `mapstructure:"group_by_resource_attributes"`
+
 	// DurationKeys is the ordered list of attribute names that hold an explicit
 	// span duration.
 	DurationKeys []string `mapstructure:"duration_keys"`
@@ -47,17 +59,25 @@ type Config struct {
 	// neither an explicit duration nor a following log provides an end time.
 	EndSpanDuration time.Duration `mapstructure:"end_span_duration"`
 
-	// ServiceName is written to the service.name resource attribute of every
-	// emitted trace.
+	// CopyResourceAttributes copies the source logs' resource attributes onto the
+	// resource of every emitted trace. When a group contains records from more
+	// than one resource, the first record's resource is used. Set to false to
+	// emit only service.name.
+	CopyResourceAttributes bool `mapstructure:"copy_resource_attributes"`
+
+	// ServiceName overrides the service.name resource attribute of every emitted
+	// trace. When empty, the source logs' service.name is preserved and
+	// "logs-to-spans" is used when the source has none.
 	ServiceName string `mapstructure:"service_name"`
 }
 
-// validateAttributeKeys rejects empty entries in group_by_attributes. An empty
-// key can never match a log attribute and only hides a typo.
-func validateAttributeKeys(keys []string) error {
+// validateAttributeKeys rejects empty entries in an attribute-name list. An
+// empty key can never match a log or resource attribute and only hides a typo.
+// field is the mapstructure name, used in the error message.
+func validateAttributeKeys(field string, keys []string) error {
 	for _, key := range keys {
 		if key == "" {
-			return errors.New("group_by_attributes must not contain an empty key")
+			return fmt.Errorf("%s must not contain an empty key", field)
 		}
 	}
 	return nil
@@ -99,7 +119,11 @@ func (cfg *Config) Validate() error {
 		errs = append(errs, err)
 	}
 
-	if err := validateAttributeKeys(cfg.GroupByAttributes); err != nil {
+	if err := validateAttributeKeys("group_by_attributes", cfg.GroupByAttributes); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := validateAttributeKeys("group_by_resource_attributes", cfg.GroupByResourceAttributes); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -118,23 +142,23 @@ func (cfg *Config) Validate() error {
 	if cfg.EndSpanDuration <= 0 {
 		errs = append(errs, fmt.Errorf("end_span_duration must be greater than zero, got %s", cfg.EndSpanDuration))
 	}
-	if cfg.ServiceName == "" {
-		errs = append(errs, errors.New("service_name must not be empty"))
-	}
-
 	return errors.Join(errs...)
 }
 
 func createDefaultConfig() *Config {
 	return &Config{
-		Timeout:           5 * time.Second,
-		MaxWait:           30 * time.Second,
-		MaxLogsPerTrace:   100,
-		MaxGroups:         1000,
-		GroupByKeys:       []string{},
-		GroupByAttributes: []string{},
-		DurationKeys:      []string{},
-		EndSpanDuration:   500 * time.Millisecond,
-		ServiceName:       "logs-to-spans",
+		Timeout:                   5 * time.Second,
+		MaxWait:                   30 * time.Second,
+		MaxLogsPerTrace:           100,
+		MaxGroups:                 1000,
+		GroupByKeys:               []string{},
+		GroupByAttributes:         []string{},
+		GroupByResourceAttributes: []string{},
+		DurationKeys:              []string{},
+		EndSpanDuration:           500 * time.Millisecond,
+		CopyResourceAttributes:    true,
+		// Empty means "preserve the source service.name, fall back to
+		// defaultServiceName". A non-empty value is an explicit override.
+		ServiceName: "",
 	}
 }

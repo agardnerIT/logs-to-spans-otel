@@ -75,15 +75,58 @@ func sendLogs(t *testing.T, conn connector.Logs, records []plog.LogRecord) {
 	require.NoError(t, err)
 }
 
+// sendLogsWithResource is sendLogs with a single source resource attribute set.
+func sendLogsWithResource(t *testing.T, conn connector.Logs, res map[string]string, records []plog.LogRecord) {
+	t.Helper()
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	for k, v := range res {
+		rl.Resource().Attributes().PutStr(k, v)
+	}
+	sl := rl.ScopeLogs().AppendEmpty()
+	for _, lr := range records {
+		lr.CopyTo(sl.LogRecords().AppendEmpty())
+	}
+	require.NoError(t, conn.ConsumeLogs(context.Background(), ld))
+}
+
+// sendLogsWithMultipleResources builds one ResourceLogs per entry, each with its
+// own resource attributes and log records, in a single ConsumeLogs call.
+func sendLogsWithMultipleResources(t *testing.T, conn connector.Logs, resources []map[string]string, records [][]plog.LogRecord) {
+	t.Helper()
+	require.Len(t, records, len(resources))
+	ld := plog.NewLogs()
+	for i, res := range resources {
+		rl := ld.ResourceLogs().AppendEmpty()
+		for k, v := range res {
+			rl.Resource().Attributes().PutStr(k, v)
+		}
+		sl := rl.ScopeLogs().AppendEmpty()
+		for _, lr := range records[i] {
+			lr.CopyTo(sl.LogRecords().AppendEmpty())
+		}
+	}
+	require.NoError(t, conn.ConsumeLogs(context.Background(), ld))
+}
+
+// addTestRecord feeds one record straight into the grouping path with no source
+// resource attributes, matching a source that sets none. Resource-aware cases
+// call addToGroup directly with a populated pcommon.Map.
+func addTestRecord(c *logsToSpansConnector, key string, lr plog.LogRecord) {
+	c.addToGroup(key, pcommon.NewMap(), lr)
+}
+
 func TestConfigDefaults(t *testing.T) {
 	cfg := createDefaultConfig()
 	assert.Equal(t, 5*time.Second, cfg.Timeout)
 	assert.Equal(t, 500*time.Millisecond, cfg.EndSpanDuration)
-	assert.Equal(t, "logs-to-spans", cfg.ServiceName)
+	assert.Empty(t, cfg.ServiceName, "empty means preserve the source service.name")
 	assert.Equal(t, 30*time.Second, cfg.MaxWait)
 	assert.Equal(t, 1000, cfg.MaxGroups)
+	assert.True(t, cfg.CopyResourceAttributes)
 	assert.Empty(t, cfg.GroupByKeys)
 	assert.Empty(t, cfg.GroupByAttributes)
+	assert.Empty(t, cfg.GroupByResourceAttributes)
 }
 
 func TestExtractGroupKey_Unstructured(t *testing.T) {
@@ -859,13 +902,13 @@ func TestUnmatchedRecordsAreDropped(t *testing.T) {
 	assert.Equal(t, 1, traces[0].SpanCount(), "only the matched record becomes a span")
 }
 
-func TestConfigValidateEmptyServiceName(t *testing.T) {
+// An empty service_name is valid: it means "preserve the source service.name
+// and fall back to logs-to-spans when the source has none". The connector
+// still guarantees every emitted trace has a service.name.
+func TestConfigValidateAllowsEmptyServiceName(t *testing.T) {
 	cfg := validTestConfig()
 	cfg.ServiceName = ""
-	err := cfg.Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "service_name")
-	assert.Empty(t, cfg.ServiceName, "Validate must not rewrite the value")
+	require.NoError(t, cfg.Validate())
 }
 
 func TestConfigValidateRejectsNoGroupByKeysOrAttributes(t *testing.T) {
@@ -1469,10 +1512,10 @@ func TestUnstructuredKeyValueWithHyphen(t *testing.T) {
 	assert.Equal(t, "abc-123", val.Str())
 }
 
-func TestServiceNameRequiredWhenEmpty(t *testing.T) {
+func TestServiceNameMayBeEmpty(t *testing.T) {
 	cfg := validTestConfig()
 	cfg.ServiceName = ""
-	require.Error(t, cfg.Validate())
+	require.NoError(t, cfg.Validate())
 }
 
 func TestConfigDefaultMaxLogsPerTrace(t *testing.T) {
@@ -1515,8 +1558,8 @@ func TestMaxGroupsEvictsLeastRecentlyUpdated(t *testing.T) {
 	c := conn.(*logsToSpansConnector)
 
 	now := time.Now()
-	c.addToGroup("a", newLogRecord("user=a one", now, "INFO"))
-	c.addToGroup("b", newLogRecord("user=b one", now, "INFO"))
+	addTestRecord(c, "a", newLogRecord("user=a one", now, "INFO"))
+	addTestRecord(c, "b", newLogRecord("user=b one", now, "INFO"))
 
 	// Make the recency order explicit rather than relying on two time.Now()
 	// calls landing in a particular order.
@@ -1525,7 +1568,7 @@ func TestMaxGroupsEvictsLeastRecentlyUpdated(t *testing.T) {
 	c.groups["b"].lastUpdated = now
 	c.mu.Unlock()
 
-	c.addToGroup("c", newLogRecord("user=c one", now, "INFO"))
+	addTestRecord(c, "c", newLogRecord("user=c one", now, "INFO"))
 
 	c.mu.Lock()
 	_, hasA := c.groups["a"]
@@ -1555,15 +1598,15 @@ func TestMaxGroupsEvictionTieBreaksByKey(t *testing.T) {
 	c := conn.(*logsToSpansConnector)
 
 	now := time.Now()
-	c.addToGroup("b", newLogRecord("user=b one", now, "INFO"))
-	c.addToGroup("a", newLogRecord("user=a one", now, "INFO"))
+	addTestRecord(c, "b", newLogRecord("user=b one", now, "INFO"))
+	addTestRecord(c, "a", newLogRecord("user=a one", now, "INFO"))
 
 	c.mu.Lock()
 	c.groups["a"].lastUpdated = now
 	c.groups["b"].lastUpdated = now
 	c.mu.Unlock()
 
-	c.addToGroup("c", newLogRecord("user=c one", now, "INFO"))
+	addTestRecord(c, "c", newLogRecord("user=c one", now, "INFO"))
 
 	c.mu.Lock()
 	_, hasA := c.groups["a"]
@@ -1589,7 +1632,7 @@ func TestMaxGroupsEvictionPreservesEveryRecord(t *testing.T) {
 
 	const keys = 7
 	for i := 0; i < keys; i++ {
-		c.addToGroup(fmt.Sprintf("key-%d", i), newLogRecord(fmt.Sprintf("user=%d log", i), time.Now(), "INFO"))
+		addTestRecord(c, fmt.Sprintf("key-%d", i), newLogRecord(fmt.Sprintf("user=%d log", i), time.Now(), "INFO"))
 	}
 
 	require.NoError(t, conn.Shutdown(context.Background()))
@@ -1612,7 +1655,7 @@ func TestMaxGroupsZeroMeansUnlimited(t *testing.T) {
 	c := conn.(*logsToSpansConnector)
 
 	for i := 0; i < 50; i++ {
-		c.addToGroup(fmt.Sprintf("key-%d", i), newLogRecord(fmt.Sprintf("user=%d log", i), time.Now(), "INFO"))
+		addTestRecord(c, fmt.Sprintf("key-%d", i), newLogRecord(fmt.Sprintf("user=%d log", i), time.Now(), "INFO"))
 	}
 
 	c.mu.Lock()
@@ -1636,8 +1679,8 @@ func TestMaxGroupsAddingToExistingKeyDoesNotEvict(t *testing.T) {
 	c := conn.(*logsToSpansConnector)
 
 	now := time.Now()
-	c.addToGroup("a", newLogRecord("user=a one", now, "INFO"))
-	c.addToGroup("a", newLogRecord("user=a two", now.Add(time.Second), "INFO"))
+	addTestRecord(c, "a", newLogRecord("user=a one", now, "INFO"))
+	addTestRecord(c, "a", newLogRecord("user=a two", now.Add(time.Second), "INFO"))
 
 	c.mu.Lock()
 	got := c.groups["a"]
@@ -1660,7 +1703,7 @@ func TestMaxGroupsEvictionIsNotReEmittedByStaleCallback(t *testing.T) {
 	c := conn.(*logsToSpansConnector)
 
 	now := time.Now()
-	c.addToGroup("a", newLogRecord("user=a one", now, "INFO"))
+	addTestRecord(c, "a", newLogRecord("user=a one", now, "INFO"))
 
 	c.mu.Lock()
 	victim := c.groups["a"]
@@ -1668,7 +1711,7 @@ func TestMaxGroupsEvictionIsNotReEmittedByStaleCallback(t *testing.T) {
 	require.NotNil(t, victim)
 
 	// Admitting b evicts and flushes a.
-	c.addToGroup("b", newLogRecord("user=b one", now, "INFO"))
+	addTestRecord(c, "b", newLogRecord("user=b one", now, "INFO"))
 	require.Len(t, sink.AllTraces(), 1)
 
 	// The evicted group's timer may still have a callback queued.
@@ -1691,7 +1734,7 @@ func TestMaxLogsPerTraceSplitReplacementHasLastUpdated(t *testing.T) {
 	conn := createTestConnector(t, cfg, sink)
 	c := conn.(*logsToSpansConnector)
 
-	c.addToGroup("a", newLogRecord("user=a one", time.Now(), "INFO"))
+	addTestRecord(c, "a", newLogRecord("user=a one", time.Now(), "INFO"))
 
 	c.mu.Lock()
 	group := c.groups["a"]
@@ -1952,7 +1995,7 @@ func TestStaleTimerCallbackDoesNotEvictReplacementGroup(t *testing.T) {
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 
 	// First record opens group g1.
-	c.addToGroup("user=123", newLogRecord("user=123 log1", now, "INFO"))
+	addTestRecord(c, "user=123", newLogRecord("user=123 log1", now, "INFO"))
 
 	c.mu.Lock()
 	g1 := c.groups["user=123"]
@@ -1961,7 +2004,7 @@ func TestStaleTimerCallbackDoesNotEvictReplacementGroup(t *testing.T) {
 
 	// Second record hits the limit: g1 is retired and replaced by g2. g1's
 	// timer callback may still be queued at this point.
-	c.addToGroup("user=123", newLogRecord("user=123 log2", now.Add(1*time.Second), "INFO"))
+	addTestRecord(c, "user=123", newLogRecord("user=123 log2", now.Add(1*time.Second), "INFO"))
 
 	c.mu.Lock()
 	g2 := c.groups["user=123"]
@@ -1983,7 +2026,7 @@ func TestStaleTimerCallbackDoesNotEvictReplacementGroup(t *testing.T) {
 	assert.Equal(t, 2, sink.AllTraces()[0].SpanCount())
 
 	// g2 keeps collecting, and its trace links back to the split trace.
-	c.addToGroup("user=123", newLogRecord("user=123 log3", now.Add(2*time.Second), "INFO"))
+	addTestRecord(c, "user=123", newLogRecord("user=123 log3", now.Add(2*time.Second), "INFO"))
 	require.NoError(t, conn.Shutdown(context.Background()))
 
 	traces := sink.AllTraces()
@@ -2008,7 +2051,7 @@ func TestFlushGroupIsIdempotent(t *testing.T) {
 	conn := createTestConnector(t, cfg, sink)
 	c := conn.(*logsToSpansConnector)
 
-	c.addToGroup("user=123", newLogRecord("user=123 only", time.Now(), "INFO"))
+	addTestRecord(c, "user=123", newLogRecord("user=123 only", time.Now(), "INFO"))
 
 	c.mu.Lock()
 	g := c.groups["user=123"]
@@ -2065,4 +2108,216 @@ func TestConcurrentSplitAndFlush(t *testing.T) {
 		seen += td.SpanCount()
 	}
 	assert.Equal(t, goroutines*perGoroutine, seen, "no record may be dropped or duplicated")
+}
+
+// --- #12: source resource attributes and resource-scoped grouping ---
+
+func TestCopyResourceAttributesToOutput(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogsWithResource(t, conn, map[string]string{
+		"host.name":           "node-1",
+		"k8s.pod.name":        "pod-a",
+		"service.instance.id": "inst-1",
+	}, []plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+
+	attrs := traces[0].ResourceSpans().At(0).Resource().Attributes().AsRaw()
+	assert.Equal(t, "node-1", attrs["host.name"])
+	assert.Equal(t, "pod-a", attrs["k8s.pod.name"])
+	assert.Equal(t, "inst-1", attrs["service.instance.id"])
+	assert.Equal(t, "logs-to-spans", attrs["service.name"],
+		"the connector default is used when the source has no service.name")
+}
+
+func TestCopyResourceAttributesDisabled(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.CopyResourceAttributes = false
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogsWithResource(t, conn, map[string]string{
+		"host.name":    "node-1",
+		"service.name": "source-svc",
+	}, []plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+
+	attrs := traces[0].ResourceSpans().At(0).Resource().Attributes().AsRaw()
+	assert.Equal(t, map[string]any{"service.name": "logs-to-spans"}, attrs,
+		"with copying disabled only service.name is emitted, using the fallback")
+}
+
+// service.name precedence: with no explicit service_name the source value is
+// preserved rather than overwritten by the connector default.
+func TestServiceNamePreservedFromSource(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	require.Empty(t, cfg.ServiceName)
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogsWithResource(t, conn, map[string]string{"service.name": "source-svc"},
+		[]plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+	val, ok := traces[0].ResourceSpans().At(0).Resource().Attributes().Get("service.name")
+	require.True(t, ok)
+	assert.Equal(t, "source-svc", val.Str())
+}
+
+// An explicit service_name is an override and always wins over the source.
+func TestServiceNameExplicitOverridesSource(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	cfg.ServiceName = "my-app"
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogsWithResource(t, conn, map[string]string{"service.name": "source-svc"},
+		[]plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+	val, ok := traces[0].ResourceSpans().At(0).Resource().Attributes().Get("service.name")
+	require.True(t, ok)
+	assert.Equal(t, "my-app", val.Str())
+}
+
+// Without group_by_resource_attributes the same key from different resources
+// merges into one group. The first record's resource wins, which is the
+// documented collapsing behaviour.
+func TestMergedGroupUsesFirstResource(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogsWithMultipleResources(t, conn,
+		[]map[string]string{
+			{"service.name": "svc-a", "host.name": "node-1"},
+			{"service.name": "svc-b", "host.name": "node-2"},
+		},
+		[][]plog.LogRecord{
+			{newLogRecord("user=123 first", now, "INFO")},
+			{newLogRecord("user=123 second", now.Add(time.Second), "INFO")},
+		})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1, "resource attributes do not scope groups by default")
+	assert.Equal(t, 2, traces[0].SpanCount())
+	attrs := traces[0].ResourceSpans().At(0).Resource().Attributes().AsRaw()
+	assert.Equal(t, "svc-a", attrs["service.name"], "the first record's resource wins")
+	assert.Equal(t, "node-1", attrs["host.name"])
+}
+
+func TestGroupByResourceAttributesSeparatesGroups(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	cfg.GroupByResourceAttributes = []string{"service.name"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogsWithMultipleResources(t, conn,
+		[]map[string]string{
+			{"service.name": "svc-a"},
+			{"service.name": "svc-b"},
+		},
+		[][]plog.LogRecord{
+			{newLogRecord("user=123 from a", now, "INFO")},
+			{newLogRecord("user=123 from b", now.Add(time.Second), "INFO")},
+		})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2, "the same key from different services must not merge")
+
+	seen := map[string]string{}
+	for _, td := range traces {
+		rs := td.ResourceSpans().At(0)
+		svc, _ := rs.Resource().Attributes().Get("service.name")
+		key, _ := rs.ScopeSpans().At(0).Spans().At(0).Attributes().Get("group.key")
+		seen[svc.Str()] = key.Str()
+	}
+	assert.Equal(t, map[string]string{"svc-a": "123", "svc-b": "123"}, seen,
+		"group.key stays the extracted value while the resource scopes the group")
+}
+
+// A resource that is missing a configured scoping attribute contributes an
+// empty component, so such resources collapse together rather than erroring.
+func TestGroupByResourceAttributesMissingAttributeCollapses(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	cfg.GroupByResourceAttributes = []string{"service.name"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogsWithMultipleResources(t, conn,
+		[]map[string]string{
+			{"host.name": "node-1"},
+			{"host.name": "node-2"},
+		},
+		[][]plog.LogRecord{
+			{newLogRecord("user=123 first", now, "INFO")},
+			{newLogRecord("user=123 second", now.Add(time.Second), "INFO")},
+		})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1, "resources missing the scoping attribute collapse together")
+	assert.Equal(t, 2, traces[0].SpanCount())
+}
+
+// A max_logs_per_trace split must not change the resource of the records that
+// follow the split.
+func TestSplitReplacementKeepsResource(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.MaxLogsPerTrace = 1
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogsWithResource(t, conn, map[string]string{"service.name": "source-svc", "host.name": "node-1"},
+		[]plog.LogRecord{
+			newLogRecord("user=123 log1", now, "INFO"),
+			newLogRecord("user=123 log2", now.Add(time.Second), "INFO"),
+		})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2, "max_logs_per_trace 1 splits each record")
+	for _, td := range traces {
+		attrs := td.ResourceSpans().At(0).Resource().Attributes().AsRaw()
+		assert.Equal(t, "source-svc", attrs["service.name"])
+		assert.Equal(t, "node-1", attrs["host.name"])
+	}
+}
+
+func TestConfigValidateRejectsEmptyResourceAttributeKey(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.GroupByResourceAttributes = []string{"service.name", ""}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group_by_resource_attributes")
 }

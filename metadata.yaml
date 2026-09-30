@@ -24,7 +24,9 @@ tests:
     max_logs_per_trace: 100
     max_groups: 1000
     group_by_keys: [userID]
+    group_by_resource_attributes: [service.name]
     end_span_duration: 500ms
+    copy_resource_attributes: true
     service_name: test-service
 
 telemetry:

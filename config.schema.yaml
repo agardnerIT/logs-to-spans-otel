@@ -1,6 +1,9 @@
 description: Config defines the configuration for the logs_to_spans connector.
 type: object
 properties:
+  copy_resource_attributes:
+    description: CopyResourceAttributes copies the source logs' resource attributes onto the resource of every emitted trace. When a group contains records from more than one resource, the first record's resource is used. Set to false to emit only service.name.
+    type: boolean
   duration_keys:
     description: DurationKeys is the ordered list of attribute names that hold an explicit span duration.
     type: array
@@ -19,6 +22,11 @@ properties:
     type: array
     items:
       type: string
+  group_by_resource_attributes:
+    description: 'GroupByResourceAttributes is the ordered list of resource attribute names that scope the group. Records whose resource differs in any of these attributes form separate groups and therefore separate traces. It is an additional scoping dimension: the extracted group key is still required. With an empty list, resource attributes do not affect grouping.'
+    type: array
+    items:
+      type: string
   max_groups:
     description: MaxGroups bounds the number of buffered groups. When a new group would exceed it, the least recently updated group is flushed early. 0 disables the bound.
     type: integer
@@ -29,7 +37,7 @@ properties:
     description: MaxWait is the maximum time a group may stay open, measured from its first log record, regardless of later activity.
     x-customType: time.duration
   service_name:
-    description: ServiceName is written to the service.name resource attribute of every emitted trace.
+    description: ServiceName overrides the service.name resource attribute of every emitted trace. When empty, the source logs' service.name is preserved and "logs-to-spans" is used when the source has none.
     type: string
   timeout:
     description: Timeout is the inactivity period after which a group is flushed. Each new log record in a group resets it.
