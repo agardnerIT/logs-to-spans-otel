@@ -240,19 +240,40 @@ PHASE 4 - FEATURES (in value order)
     mdatagen-generated during #17.
 
 
-[6] #14  Support extracting the group key from log attributes, not just the
+[6] #14  DONE - issue closed. Commit b3d745c.
+         Support extracting the group key from log attributes, not just the
          body
          https://github.com/agardnerIT/logs-to-spans-otel/issues/14
 
-    Biggest adoption win. Today the group key can only come from the log body,
-    so every structured-logging user must insert a `transform` processor to
-    stringify the field back into the body first. The natural pipeline
-    (filelog + json_parser, or any OTLP-native app) already puts these fields
-    in attributes.
+    Outcome: new `group_by_attributes` option, a list of log attribute names
+    searched in order. Precedence is defined as attributes first, then body:
+    attribute match wins over `group_by_keys` because attributes are explicit
+    structured fields while the body regex is a heuristic. Attribute values
+    are stringified via valueToString, so int/bool attributes work.
 
-    Scope: group_by_attributes, searched in order, with defined precedence
-    against group_by_keys. Document it. Update the README section that
-    currently teaches the transform-processor workaround.
+    Validation: `group_by_keys` is no longer unconditionally required. The
+    config now needs at least one of `group_by_keys` or `group_by_attributes`;
+    an empty key in either list is an error. Error text and the
+    unmatched_dropped metric description updated accordingly.
+
+    Tests: 9 new - extraction order, non-string attribute, empty-value
+    fallthrough, attribute-over-body precedence for string and Map bodies,
+    body fallback when the attribute is absent, attributes-only end-to-end
+    grouping into two traces, and the three validation cases.
+
+    README: rewrote "Key extraction" (three strategies, precedence, exact
+    matching, stringified values), added the `group_by_attributes` reference
+    row, removed "(required)" from `group_by_keys`, updated the example, the
+    Unreleased changelog, the unmatched-filtering text, and rewrote the
+    filelog option in "Grouping non k=v logs" to teach
+    regex_parser + group_by_attributes instead of the old body-only caveat.
+
+    Verified: go vet + go test -race clean; OCB working-tree build (replace
+    present) + validate collector.yaml; end-to-end run with an attributes-only
+    config (filelog regex_parser -> group_by_attributes) produced 3 traces
+    with group keys 123 / 222 / 23; CI run 36708308716 green.
+
+    Second in Phase 4: the biggest adoption win. Next actual work: #11, #17.
 
 
 [7] #11  Bound group cardinality (max_groups / TTL eviction) to prevent
@@ -362,10 +383,10 @@ A credible donation does not need all 13. Ship this set and defer #12, #13,
 #3, #15:
 
     #10 (DONE) -> #9 + #16 (DONE) -> #7 (DONE) -> #8 (DONE) -> #1 (DONE)
-    -> #14 -> #11 -> #17
+    -> #14 (DONE) -> #11 -> #17
 
-    Both phases 1-3 are closed and #1 is now in. Next actual work: #14
-    (group_by_attributes), then #11, #17.
+    Both phases 1-3 are closed and Phase 4 is half in. Next actual work: #11
+    (bound group cardinality), then #17 (donation readiness).
 
 #11 is deliberately included rather than deferred - it is the one a reviewer
 will raise on the first pass.
