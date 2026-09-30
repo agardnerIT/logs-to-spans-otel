@@ -276,20 +276,49 @@ PHASE 4 - FEATURES (in value order)
     Second in Phase 4: the biggest adoption win. Next actual work: #11, #17.
 
 
-[7] #11  Bound group cardinality (max_groups / TTL eviction) to prevent
+[7] #11  DONE - issue closed. Commit af101ac.
+         Bound group cardinality (max_groups / TTL eviction) to prevent
          unbounded memory growth
          https://github.com/agardnerIT/logs-to-spans-otel/issues/11
 
-    DO NOT DEFER THIS ONE. "Unbounded memory under high-cardinality keys" is
-    the first question a reviewer asks about a stateful connector.
-    max_logs_per_trace bounds each group but nothing bounds the NUMBER of
-    groups - a per-request UUID key creates one map entry and two live timers
-    per distinct value until timeout.
+    Outcome: new `max_groups` option (default 1000, 0 disables). When a log
+    record opens a new group and the map already holds max_groups groups, the
+    least recently updated group is flushed early and emitted as a trace
+    before the new group is admitted. Ties are broken by key so eviction is
+    deterministic. The victim is marked flushed and both timers stopped before
+    it leaves the map, reusing the #7 retire-before-removal discipline, so an
+    already-queued callback cannot re-emit it or delete a replacement. Only a
+    NEW key can trigger eviction - adding records to a buffered group never
+    evicts it, so a hot key is never split by the cap. Evicted records are not
+    dropped, only re-bounded: the trace boundary moves earlier.
 
-    Prior art to copy: connector/servicegraphconnector StoreConfig -
-    MaxItems, TTL, cache_loop, store_expiration_loop.
+    Decision - no `group_ttl`. max_wait is already a hard TTL from the first
+    log in a group; a separate TTL option would duplicate it. Documented
+    instead of adding dead-ish surface.
 
-    Consumes the counters from #1.
+    Two metrics, consuming #1's meter: `..._groups_evicted` (counter) and
+    `..._active_groups` (observable gauge polled from len(c.groups) under the
+    same mutex). The gauge is the operator's view of the bound; the counter
+    is the eviction signal. No debug log per eviction - the counter is the
+    durable signal and a per-eviction log would flood under high cardinality.
+
+    Two latent bugs found and fixed while writing the tests:
+      - the max_logs_per_trace split created its replacement group with a zero
+        lastUpdated, which would have made every fresh replacement the first
+        eviction victim. New group now gets time.Now().
+      - replacement groups from a split need the same recency stamp as any
+        other live group. Regression test asserts it is non-zero.
+
+    Tests: 11 new. LRU choice, deterministic tie-break, 0=unlimited, no
+    eviction on an existing key, every record survives eviction, stale-callback
+    idempotency, split-replacement recency, groups_evicted counter,
+    active_groups gauge, negative/zero validation. go vet + go test -race
+    clean. OCB working-tree build + validate collector.yaml clean; end-to-end
+    with max_groups: 1 reports groups_evicted 2 / traces_created 3, and the
+    shipped example reports active_groups 0 after flush.
+
+    Consumed the counters from #1. #15 (and #12's key construction) still
+    follow and must build on this addToGroup shape.
 
 
 [8] #12  Preserve source resource attributes and scope grouping by resource
@@ -383,10 +412,11 @@ A credible donation does not need all 13. Ship this set and defer #12, #13,
 #3, #15:
 
     #10 (DONE) -> #9 + #16 (DONE) -> #7 (DONE) -> #8 (DONE) -> #1 (DONE)
-    -> #14 (DONE) -> #11 -> #17
+    -> #14 (DONE) -> #11 (DONE) -> #17
 
-    Both phases 1-3 are closed and Phase 4 is half in. Next actual work: #11
-    (bound group cardinality), then #17 (donation readiness).
+    Both phases 1-3 are closed and Phase 4 is three-quarters in. Next actual
+    work: #17 (donation readiness), optionally #12/#13/#3/#15 if the donation
+    has to wait.
 
 #11 is deliberately included rather than deferred - it is the one a reviewer
 will raise on the first pass.
