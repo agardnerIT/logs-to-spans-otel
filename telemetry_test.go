@@ -74,6 +74,27 @@ func metricsTestConfig() *Config {
 	return cfg
 }
 
+// collectInt64Gauges reads every recorded int64 gauge, keyed by metric name.
+func collectInt64Gauges(t *testing.T, reader *metric.ManualReader) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+
+	gauges := make(map[string]int64)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if gauge, ok := m.Data.(metricdata.Gauge[int64]); ok {
+				var latest int64
+				for _, dp := range gauge.DataPoints {
+					latest = dp.Value
+				}
+				gauges[m.Name] = latest
+			}
+		}
+	}
+	return gauges
+}
+
 func TestMetricsLogsIngestedAndTracesCreated(t *testing.T) {
 	sink := newTestSink()
 	conn, reader := createMetricsTestConnector(t, metricsTestConfig(), sink)
@@ -129,6 +150,50 @@ func TestMetricsTracesCreatedCountsEveryGroup(t *testing.T) {
 	counters := collectInt64Counters(t, reader)
 	assert.Equal(t, int64(3), counters[metricTracesCreated])
 	require.Len(t, sink.AllTraces(), 3)
+}
+
+// TestMetricsGroupsEvictedCounter covers issue #11: an eviction caused by
+// max_groups must be observable, otherwise a cap silently reshapes traces.
+func TestMetricsGroupsEvictedCounter(t *testing.T) {
+	sink := newTestSink()
+	cfg := metricsTestConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxGroups = 1
+	conn, reader := createMetricsTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogs(t, conn, []plog.LogRecord{
+		newLogRecord("user=1 one", now, "INFO"),
+		newLogRecord("user=2 two", now, "INFO"),
+		newLogRecord("user=3 three", now, "INFO"),
+	})
+
+	counters := collectInt64Counters(t, reader)
+	assert.Equal(t, int64(2), counters[metricGroupsEvicted],
+		"each distinct key past the cap evicts the previous group")
+	assert.Equal(t, int64(3), counters[metricLogsIngested])
+}
+
+// TestMetricsActiveGroupsGauge reports the buffered group count at collection
+// time, so operators can see the map size against their max_groups cap.
+func TestMetricsActiveGroupsGauge(t *testing.T) {
+	sink := newTestSink()
+	cfg := metricsTestConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxGroups = 10
+	conn, reader := createMetricsTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogs(t, conn, []plog.LogRecord{
+		newLogRecord("user=1 one", now, "INFO"),
+		newLogRecord("user=2 two", now, "INFO"),
+		newLogRecord("user=3 three", now, "INFO"),
+	})
+
+	gauges := collectInt64Gauges(t, reader)
+	assert.Equal(t, int64(3), gauges[metricActiveGroups])
 }
 
 // The meter is optional outside the collector: constructing the connector

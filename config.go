@@ -11,6 +11,7 @@ type Config struct {
 	Timeout           time.Duration `mapstructure:"timeout"`
 	MaxWait           time.Duration `mapstructure:"max_wait"`
 	MaxLogsPerTrace   int           `mapstructure:"max_logs_per_trace"`
+	MaxGroups         int           `mapstructure:"max_groups"`
 	GroupByKeys       []string      `mapstructure:"group_by_keys"`
 	GroupByAttributes []string      `mapstructure:"group_by_attributes"`
 	DurationKeys      []string      `mapstructure:"duration_keys"`
@@ -78,6 +79,9 @@ func (cfg *Config) Validate() error {
 	if cfg.MaxLogsPerTrace < 0 {
 		errs = append(errs, fmt.Errorf("max_logs_per_trace must not be negative, got %d", cfg.MaxLogsPerTrace))
 	}
+	if cfg.MaxGroups < 0 {
+		errs = append(errs, fmt.Errorf("max_groups must not be negative, got %d", cfg.MaxGroups))
+	}
 	if cfg.EndSpanDuration <= 0 {
 		errs = append(errs, fmt.Errorf("end_span_duration must be greater than zero, got %s", cfg.EndSpanDuration))
 	}
@@ -93,6 +97,7 @@ func createDefaultConfig() *Config {
 		Timeout:           5 * time.Second,
 		MaxWait:           30 * time.Second,
 		MaxLogsPerTrace:   100,
+		MaxGroups:         1000,
 		GroupByKeys:       []string{},
 		GroupByAttributes: []string{},
 		DurationKeys:      []string{},

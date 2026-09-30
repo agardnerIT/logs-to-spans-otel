@@ -36,6 +36,9 @@ type logGroup struct {
 	prevSpanID  pcommon.SpanID
 	traceID     pcommon.TraceID
 	lastSpanID  pcommon.SpanID
+	// lastUpdated is the time the most recent record was added. It drives the
+	// least-recently-updated eviction when max_groups is reached.
+	lastUpdated time.Time
 	// flushed guards against a group being emitted twice. time.Timer.Stop()
 	// returns false when the callback has already fired and is queued, so a
 	// stale callback can still run after the group has left the map. It also
@@ -52,6 +55,15 @@ type logRecord struct {
 
 func (c *logsToSpansConnector) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: false}
+}
+
+// activeGroupCount reports how many groups are buffered right now. It is read
+// by the active_groups observable gauge, so it takes the same lock every other
+// map access takes.
+func (c *logsToSpansConnector) activeGroupCount() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return int64(len(c.groups))
 }
 
 func (c *logsToSpansConnector) Start(_ context.Context, _ component.Host) error {
@@ -114,7 +126,14 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 	}
 
 	group, exists := c.groups[key]
+	var evicted *logGroup
 	if !exists {
+		// Bound the number of live groups. A high-cardinality key (a request or
+		// connection ID, a raw trace ID) otherwise creates one map entry and two
+		// live timers per distinct value until the timeout fires.
+		if c.config.MaxGroups > 0 && len(c.groups) >= c.config.MaxGroups {
+			evicted = c.evictLeastRecentlyUpdatedLocked()
+		}
 		group = &logGroup{key: key}
 		c.groups[key] = group
 		group.maxTimer = time.AfterFunc(c.config.MaxWait, func() {
@@ -122,6 +141,7 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		})
 	}
 
+	group.lastUpdated = time.Now()
 	group.records = append(group.records, extractLogRecord(lr, c.config))
 
 	if group.timer != nil {
@@ -154,6 +174,7 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 		group.records = nil
 
 		newGroup := &logGroup{key: key}
+		newGroup.lastUpdated = time.Now()
 		newGroup.prevTraceID = traceID
 		newGroup.prevSpanID = lastSpanID
 		c.groups[key] = newGroup
@@ -172,10 +193,61 @@ func (c *logsToSpansConnector) addToGroup(key string, lr plog.LogRecord) {
 			traceID:     traceID,
 			lastSpanID:  lastSpanID,
 		})
+		c.emitEvictedGroup(evicted)
 		return
 	}
 
 	c.mu.Unlock()
+	c.emitEvictedGroup(evicted)
+}
+
+// evictLeastRecentlyUpdatedLocked removes and returns the group with the
+// oldest lastUpdated time so a new group can take its place. The caller must
+// hold c.mu. Ties are broken by key, which keeps eviction deterministic when
+// two groups were updated in the same clock tick.
+func (c *logsToSpansConnector) evictLeastRecentlyUpdatedLocked() *logGroup {
+	var victimKey string
+	var victim *logGroup
+	for key, group := range c.groups {
+		if victim == nil || group.lastUpdated.Before(victim.lastUpdated) ||
+			(group.lastUpdated.Equal(victim.lastUpdated) && key < victimKey) {
+			victimKey, victim = key, group
+		}
+	}
+	if victim == nil {
+		return nil
+	}
+
+	// Retire the victim before it leaves the map, exactly as the
+	// max_logs_per_trace split does: an already-queued timer callback must
+	// find the group flushed instead of re-emitting it or deleting a
+	// replacement.
+	victim.flushed = true
+	if victim.timer != nil {
+		victim.timer.Stop()
+	}
+	if victim.maxTimer != nil {
+		victim.maxTimer.Stop()
+	}
+	delete(c.groups, victimKey)
+	return victim
+}
+
+// emitEvictedGroup converts a group evicted by max_groups into a trace. The
+// group has already left the map with its timers stopped, so this only emits.
+// Evicted records are not lost - the group is flushed early - but the early
+// trace boundary is visible to operators through the groups_evicted counter.
+func (c *logsToSpansConnector) emitEvictedGroup(group *logGroup) {
+	if group == nil {
+		return
+	}
+	c.telemetry.groupsEvicted.Add(context.Background(), 1)
+	c.logger.Debug("evicted least recently updated group: max_groups reached",
+		zap.String("group_key", group.key),
+		zap.Int("max_groups", c.config.MaxGroups),
+		zap.Int("log_count", len(group.records)),
+	)
+	c.processGroup(context.Background(), group)
 }
 
 func (c *logsToSpansConnector) flushGroup(key string, group *logGroup) {

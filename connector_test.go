@@ -78,6 +78,7 @@ func TestConfigDefaults(t *testing.T) {
 	assert.Equal(t, 500*time.Millisecond, cfg.EndSpanDuration)
 	assert.Equal(t, "logs-to-spans", cfg.ServiceName)
 	assert.Equal(t, 30*time.Second, cfg.MaxWait)
+	assert.Equal(t, 1000, cfg.MaxGroups)
 	assert.Empty(t, cfg.GroupByKeys)
 	assert.Empty(t, cfg.GroupByAttributes)
 }
@@ -916,6 +917,7 @@ func TestConfigValidateDoesNotMutate(t *testing.T) {
 	assert.Zero(t, cfg.Timeout)
 	assert.Zero(t, cfg.MaxWait)
 	assert.Zero(t, cfg.EndSpanDuration)
+	assert.Zero(t, cfg.MaxGroups)
 	assert.Empty(t, cfg.ServiceName)
 }
 
@@ -924,12 +926,14 @@ func TestConfigValidateKeepsExplicitValues(t *testing.T) {
 	cfg.Timeout = 10 * time.Second
 	cfg.MaxWait = 60 * time.Second
 	cfg.EndSpanDuration = 1 * time.Second
+	cfg.MaxGroups = 42
 	cfg.ServiceName = "custom"
 	err := cfg.Validate()
 	require.NoError(t, err)
 	assert.Equal(t, 10*time.Second, cfg.Timeout)
 	assert.Equal(t, 60*time.Second, cfg.MaxWait)
 	assert.Equal(t, 1*time.Second, cfg.EndSpanDuration)
+	assert.Equal(t, 42, cfg.MaxGroups)
 	assert.Equal(t, "custom", cfg.ServiceName)
 }
 
@@ -1480,6 +1484,219 @@ func TestConfigValidateNegativeMaxLogsPerTrace(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "max_logs_per_trace")
 	assert.Equal(t, -1, cfg.MaxLogsPerTrace, "Validate must not rewrite the value")
+}
+
+func TestConfigValidateNegativeMaxGroups(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.MaxGroups = -1
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_groups")
+	assert.Equal(t, -1, cfg.MaxGroups, "Validate must not rewrite the value")
+}
+
+func TestConfigValidateZeroMaxGroupsMeansUnlimited(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.MaxGroups = 0
+	require.NoError(t, cfg.Validate(), "0 disables the cap, matching max_logs_per_trace")
+}
+
+func TestMaxGroupsEvictsLeastRecentlyUpdated(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxGroups = 2
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	now := time.Now()
+	c.addToGroup("a", newLogRecord("user=a one", now, "INFO"))
+	c.addToGroup("b", newLogRecord("user=b one", now, "INFO"))
+
+	// Make the recency order explicit rather than relying on two time.Now()
+	// calls landing in a particular order.
+	c.mu.Lock()
+	c.groups["a"].lastUpdated = now.Add(-time.Minute)
+	c.groups["b"].lastUpdated = now
+	c.mu.Unlock()
+
+	c.addToGroup("c", newLogRecord("user=c one", now, "INFO"))
+
+	c.mu.Lock()
+	_, hasA := c.groups["a"]
+	_, hasB := c.groups["b"]
+	_, hasC := c.groups["c"]
+	c.mu.Unlock()
+
+	assert.False(t, hasA, "the least recently updated group must be evicted")
+	assert.True(t, hasB, "recently updated groups must be kept")
+	assert.True(t, hasC, "the new group must be admitted")
+
+	// Eviction flushes the victim rather than dropping it.
+	require.Len(t, sink.AllTraces(), 1)
+	assert.Equal(t, 1, sink.AllTraces()[0].SpanCount())
+}
+
+// With equal lastUpdated timestamps eviction must still be deterministic,
+// otherwise a high-cardinality stream could evict an arbitrary group.
+func TestMaxGroupsEvictionTieBreaksByKey(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxGroups = 2
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	now := time.Now()
+	c.addToGroup("b", newLogRecord("user=b one", now, "INFO"))
+	c.addToGroup("a", newLogRecord("user=a one", now, "INFO"))
+
+	c.mu.Lock()
+	c.groups["a"].lastUpdated = now
+	c.groups["b"].lastUpdated = now
+	c.mu.Unlock()
+
+	c.addToGroup("c", newLogRecord("user=c one", now, "INFO"))
+
+	c.mu.Lock()
+	_, hasA := c.groups["a"]
+	_, hasB := c.groups["b"]
+	c.mu.Unlock()
+
+	assert.False(t, hasA, "ties are broken by key, so a goes first")
+	assert.True(t, hasB)
+}
+
+// A cap of one forces an eviction on every subsequent distinct key. Every
+// record must still surface, exactly once, either in an eviction trace or in
+// the Shutdown flush.
+func TestMaxGroupsEvictionPreservesEveryRecord(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxGroups = 1
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	const keys = 7
+	for i := 0; i < keys; i++ {
+		c.addToGroup(fmt.Sprintf("key-%d", i), newLogRecord(fmt.Sprintf("user=%d log", i), time.Now(), "INFO"))
+	}
+
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	seen := 0
+	for _, td := range sink.AllTraces() {
+		seen += td.SpanCount()
+	}
+	assert.Equal(t, keys, seen, "no evicted record may be dropped or duplicated")
+}
+
+func TestMaxGroupsZeroMeansUnlimited(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxGroups = 0
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	for i := 0; i < 50; i++ {
+		c.addToGroup(fmt.Sprintf("key-%d", i), newLogRecord(fmt.Sprintf("user=%d log", i), time.Now(), "INFO"))
+	}
+
+	c.mu.Lock()
+	got := len(c.groups)
+	c.mu.Unlock()
+
+	assert.Equal(t, 50, got, "max_groups: 0 must disable the cap")
+	assert.Empty(t, sink.AllTraces(), "nothing may be evicted with the cap disabled")
+}
+
+// The cap applies to opening a new group, not to adding records to a group
+// that already exists. Otherwise a hot key would be split by eviction.
+func TestMaxGroupsAddingToExistingKeyDoesNotEvict(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxGroups = 1
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	now := time.Now()
+	c.addToGroup("a", newLogRecord("user=a one", now, "INFO"))
+	c.addToGroup("a", newLogRecord("user=a two", now.Add(time.Second), "INFO"))
+
+	c.mu.Lock()
+	got := c.groups["a"]
+	c.mu.Unlock()
+
+	require.NotNil(t, got)
+	assert.Len(t, got.records, 2, "both records must stay in the same group")
+	assert.Empty(t, sink.AllTraces(), "no eviction for an existing key")
+}
+
+// The evicted group's already-queued timer callback must not emit it twice.
+func TestMaxGroupsEvictionIsNotReEmittedByStaleCallback(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxGroups = 1
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	now := time.Now()
+	c.addToGroup("a", newLogRecord("user=a one", now, "INFO"))
+
+	c.mu.Lock()
+	victim := c.groups["a"]
+	c.mu.Unlock()
+	require.NotNil(t, victim)
+
+	// Admitting b evicts and flushes a.
+	c.addToGroup("b", newLogRecord("user=b one", now, "INFO"))
+	require.Len(t, sink.AllTraces(), 1)
+
+	// The evicted group's timer may still have a callback queued.
+	c.flushGroup("a", victim)
+
+	require.Len(t, sink.AllTraces(), 1, "an evicted group must be emitted exactly once")
+}
+
+// A group created by a max_logs_per_trace split replaces a flushed group and
+// is live, so it must carry a recency stamp. Without one it looks infinitely
+// old and becomes the first max_groups eviction victim.
+func TestMaxLogsPerTraceSplitReplacementHasLastUpdated(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 1
+	cfg.MaxGroups = 10
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	c.addToGroup("a", newLogRecord("user=a one", time.Now(), "INFO"))
+
+	c.mu.Lock()
+	group := c.groups["a"]
+	c.mu.Unlock()
+
+	require.NotNil(t, group)
+	assert.False(t, group.lastUpdated.IsZero(),
+		"the replacement group from a split is live and must have a recency stamp")
 }
 
 func TestConfigValidateZeroMaxLogsPerTrace(t *testing.T) {

@@ -91,19 +91,25 @@ Spans are sorted by start timestamp before emission, regardless of the order the
 
 > **Caveat — grouping ignores resource attributes.** Two different pods that log the same extracted value (say `userID=123`) merge into a single trace. Preserving resource attributes and scoping the group key by resource is tracked in [#12](https://github.com/agardnerIT/logs-to-spans-otel/issues/12).
 
+> **`max_groups` eviction flushes a group before its timeout.** The records are still emitted as a trace, exactly once; only the trace boundary moves. See [Bounding memory with `max_groups`](#bounding-memory-with-max_groups).
+
 > **The connector does not mutate its input.** It declares `Capabilities{MutatesData: false}` and copies everything it needs out of each log record before the upstream batch is released.
 
 ### Produced metrics
 
 The connector reports its own internal counters through the collector's `MeterProvider`, so they are emitted on the collector's self-telemetry (the `service::telemetry::metrics` endpoint, `localhost:8888/metrics` by default) and never mixed into the spans being produced. They are for operators: use them to see whether the connector is dropping input or emitting traces at the rate you expect.
 
-| Metric | Type | Incremented when |
-|--------|------|------------------|
-| `otelcol_connector_logs_to_spans_logs_ingested` | counter | every log record the connector consumes |
-| `otelcol_connector_logs_to_spans_traces_created` | counter | every group is flushed and a trace is emitted |
-| `otelcol_connector_logs_to_spans_unmatched_dropped` | counter | a log record matches no `group_by_keys` or `group_by_attributes` entry and is dropped |
+| Metric | Type | Recorded value |
+|--------|------|----------------|
+| `otelcol_connector_logs_to_spans_logs_ingested` | counter | +1 per log record the connector consumes |
+| `otelcol_connector_logs_to_spans_traces_created` | counter | +1 per group flushed and emitted as a trace — by `timeout`, `max_wait`, a `max_logs_per_trace` split, a `max_groups` eviction, or shutdown |
+| `otelcol_connector_logs_to_spans_unmatched_dropped` | counter | +1 per log record that matches no `group_by_keys` or `group_by_attributes` entry |
+| `otelcol_connector_logs_to_spans_groups_evicted` | counter | +1 per group flushed early because `max_groups` was reached |
+| `otelcol_connector_logs_to_spans_active_groups` | gauge | number of groups buffered at collection time |
 
 `logs_ingested` is the total seen, so `logs_ingested - unmatched_dropped` is the number of records that were grouped, and `traces_created` counts the resulting traces. A rising `unmatched_dropped` means the configured keys do not match the input — see [Key extraction](#key-extraction) and the caveat in [Filtering unmatched logs](#filtering-unmatched-logs).
+
+`active_groups` should sit at or below `max_groups`. If it is pinned there, the cap is being hit and `groups_evicted` counts how often; raise `max_groups` or reduce key cardinality. See [Bounding memory with `max_groups`](#bounding-memory-with-max_groups).
 
 ```yaml
 service:
@@ -127,12 +133,25 @@ service:
 | `timeout` | duration | `5s` | **Inactivity timeout.** Resets every time a new log arrives for a group. When no new logs arrive for this long, the group is flushed and converted to a trace. |
 | `max_wait` | duration | `30s` | **Absolute max wait.** Maximum time from the *first* log in a group before it is force-flushed — regardless of ongoing activity. Prevents groups with continuous log streams from never being emitted. |
 | `max_logs_per_trace` | int | `100` | **Max logs per trace.** Maximum number of log records in a single group/trace. When the limit is reached, the current group is flushed early and a new group starts. Set to `0` for no limit. Traces are connected via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links). |
+| `max_groups` | int | `1000` | **Max concurrent groups.** Hard cap on the number of buffered groups. When opening a new group would exceed it, the least recently updated group is flushed early and emitted as a trace before the new group is admitted. Set to `0` for no limit. See [Bounding memory with `max_groups`](#bounding-memory-with-max_groups). |
 | `group_by_keys` | string list | `[]` | Keys to extract from each log body and group by (tried in order). Matched literally, not as regexes. At least one of `group_by_keys` or `group_by_attributes` must be set. See [Key extraction](#key-extraction). |
 | `group_by_attributes` | string list | `[]` | Log attribute names to group by (tried in order). Checked **before** `group_by_keys`; attribute values are stringified. Matched literally, not as regexes. See [Key extraction](#key-extraction). |
 | `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
 
 > **`timeout` vs `max_wait`:** `timeout` is a *sliding* inactivity window — it resets every time a new log arrives. `max_wait` is a *fixed* deadline from the moment the group is created. A group is flushed when *either* timer fires first.
+
+### Bounding memory with `max_groups`
+
+`max_logs_per_trace` bounds the size of one group and `max_wait` bounds how long any group lives, but neither bounds how many groups exist at once. A high-cardinality key — a per-request UUID, a connection ID, a raw trace ID — would otherwise add one map entry and two live timers per distinct value. `max_groups` is that bound.
+
+When a log record opens a group and the map already holds `max_groups` groups, the connector evicts the **least recently updated** group (ties broken by key, so the choice is deterministic) before admitting the new one. Eviction is a normal flush: the group's records are sorted, converted to a trace, and emitted. Nothing is dropped, but that key gets its trace boundary earlier than its `timeout` or `max_wait` would have produced.
+
+Eviction happens only when a **new** key is opened. Adding records to a group that is already buffered never evicts it, so a hot key is never split by the cap.
+
+Set `max_groups: 0` to disable the cap — the same convention as `max_logs_per_trace: 0`. It is not recommended for keys you do not control: memory then grows with the number of distinct keys until each group times out. `max_wait` is already the per-group TTL, so there is no separate TTL option.
+
+Use the `groups_evicted` counter and `active_groups` gauge (see [Produced metrics](#produced-metrics)) to see the cap working. The search for the least recently updated group is linear in `max_groups` and runs only when the cap is reached.
 
 ### Example
 
@@ -143,6 +162,7 @@ connectors:
     timeout: 5s
     max_wait: 30s
     max_logs_per_trace: 100
+    max_groups: 1000
     group_by_keys:
       - user
       - userID
@@ -352,6 +372,7 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Added `max_groups` (default `1000`, `0` disables) to bound the number of concurrent groups. Previously only `max_logs_per_trace` bounded each group; nothing bounded how many existed, so a high-cardinality key created one map entry and two live timers per distinct value until it timed out. When the cap is reached the **least recently updated** group is flushed early and emitted as a trace before the new group is admitted — no records are lost, but the trace boundary moves. Two internal metrics make the cap observable: `otelcol_connector_logs_to_spans_groups_evicted` (counter) and `otelcol_connector_logs_to_spans_active_groups` (gauge). There is no separate TTL option because `max_wait` already bounds a group's absolute lifetime. ([#11](https://github.com/agardnerIT/logs-to-spans-otel/issues/11))
 - Added `group_by_attributes` to read the group key from log attributes instead of the body. Attributes are searched before `group_by_keys`, so structured logs (`filelog` + `json_parser`, or any OTLP-native application) no longer need a `transform` processor to copy the field back into the body. Attribute values are stringified, so numeric and boolean fields work too. At least one of `group_by_attributes` or `group_by_keys` is now required. ([#14](https://github.com/agardnerIT/logs-to-spans-otel/issues/14))
 - Added internal metrics so operators can observe the connector on the collector's own telemetry endpoint: `otelcol_connector_logs_to_spans_logs_ingested`, `otelcol_connector_logs_to_spans_traces_created`, and `otelcol_connector_logs_to_spans_unmatched_dropped`. Unmatched records have always been dropped silently; the counter makes that visible. New [Produced metrics](#produced-metrics) table. ([#1](https://github.com/agardnerIT/logs-to-spans-otel/issues/1))
 - **BREAKING:** removed the `unmatched_behaviour` option. It was declared, defaulted and validated but never read, and `pass_through` was not implementable — the factory registers only `connector.WithLogsToTraces`, so the connector has no logs consumer and cannot emit log records. Users who chose `pass_through` to avoid data loss were getting a silent drop. Unmatched records are dropped by design; split them into a separate pipeline with the `filterprocessor` beforehand (recipe in [Filtering unmatched logs](#filtering-unmatched-logs)). Configs that still set the key now fail to load with `has invalid keys: unmatched_behaviour` — a loud failure instead of a documented no-op.

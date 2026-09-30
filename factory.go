@@ -34,17 +34,19 @@ func createLogsToTraces(
 		return nil, err
 	}
 
-	telemetry, err := newTelemetry(set.TelemetrySettings)
-	if err != nil {
-		return nil, err
-	}
-
-	return &logsToSpansConnector{
+	conn := &logsToSpansConnector{
 		config:         c,
 		logger:         set.Logger,
 		tracesConsumer: tracesConsumer,
 		groups:         make(map[string]*logGroup),
 		compiledRegex:  compiledRegex,
-		telemetry:      telemetry,
-	}, nil
+	}
+
+	telemetry, err := newTelemetry(set.TelemetrySettings, conn.activeGroupCount)
+	if err != nil {
+		return nil, err
+	}
+	conn.telemetry = telemetry
+
+	return conn, nil
 }
