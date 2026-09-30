@@ -1,0 +1,432 @@
+fix-order.txt
+=============
+
+Working order for the logs-to-spans OpenTelemetry connector, ahead of the
+donation to opentelemetry-collector-contrib.
+
+Repo:   https://github.com/agardnerIT/logs-to-spans-otel
+Issues: https://github.com/agardnerIT/logs-to-spans-otel/issues
+
+Three constraints drive the order:
+
+  1. You cannot manually verify any later fix until the collector builds and
+     the shipped example config validates. That is session 1.
+
+  2. Three issues rewrite the same function (`addToGroup` in connector.go):
+     #7, #11, #15. Sequence them and you get one clean refactor; parallelise
+     them and you get three conflicting rewrites.
+
+  3. The config surface must be frozen exactly once. #8 and the type-naming
+     decision change it, and so do #1, #3, #11, #12, #13, #14. The donation
+     issue asks for the full option list, and metadata.yaml /
+     config.schema.yaml / the README config table must be written against a
+     surface that has stopped moving. Hence the Phase 3 decision gate.
+
+RUN IN PARALLEL, FROM DAY ONE
+-----------------------------
+
+Sponsor + codeowners. This is the critical path, not the code. Per
+docs/new-components.md a donation needs a sponsor who is an approver or
+maintainer AND from a different company, plus three codeowners (at least one
+an approver/maintainer). Announce in #otel-collector-dev and raise it in the
+Collector SIG meeting. The code work below IS the sponsor pitch - the doc
+says activity and reputation in your own repo is what makes the case - but
+the conversations should start now.
+
+
+PHASE 1 - UNBLOCK
+=================
+
+[1] #10  DONE - issue closed. Commits 90f499e, c5f8224, bf41783.
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/10
+
+    Outcomes (kept for reference, no longer needs a session):
+      - v0.4.0 tagged + pushed; invalid `v0.4` tag deleted local + remote.
+      - builder-config.yaml repinned v0.2.0 -> v0.4.0; dist.version 0.4.0.
+      - collector.yaml: timestamp layout is now strptime `%Y-%m-%d %H:%M:%S`
+        (matches the space-separated timestamps in input.log - do not use the
+        Go layout, the parser rejects any digits in the format string).
+      - Removed unused filter/include_matched and filter/exclude_matched from
+        collector.yaml; added `on_error: send_quiet` so the many lines with
+        no timestamp prefix don't log an error each.
+      - collector2.yaml deleted (no traces pipeline, unreferenced).
+      - .github/workflows/ci.yaml builds with OCB then runs
+        `validate --config` on every *.yaml except builder-config.yaml.
+    Verified: clean clone -> ocb -> validate -> 3 traces; CI green.
+
+[1b] #18 DONE - issue closed. Commit eda3916.
+         CI builds the published v0.4.0 connector, not the working tree (and
+         never runs go test)
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/18
+
+    Not in the original order but had to come first: with CI compiling the
+    released tag and skipping go test, a green run proved nothing.
+      - builder-config.yaml gained the replaces: block (working tree).
+      - ci.yaml runs go vet ./... and go test -race -count=1 ./... before the
+        OCB build.
+    Verified: CI run 36704079274 green with all 8 steps including vet, tests,
+    OCB build and config validation.
+
+
+PHASE 2 - CORRECTNESS
+=====================
+
+Do these before building features on top of this code.
+
+[2] #9 + #16  DONE - issues closed. Commit 678ba29.
+         (Validated with OCB built against the working tree: bad keys/configs now
+         error instead of panicking; see issue comments for evidence.)
+
+         Bug: group_by_keys is interpolated into a regex unescaped, causing
+         startup panics and false matches
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/9
+         Config.Validate should return errors instead of silently rewriting
+         invalid config
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/16
+
+    Why together: the fix for #9 is "compile in Validate() and return an
+    error instead of panicking in the factory" - that IS #16.
+
+    Note: closed issue #2 fixed compiling the regex once, for PERFORMANCE.
+    This is a different defect - the pattern is still built by string
+    concatenation, so it panics on `user(` and mis-matches `user.id` because
+    `.` is a wildcard.
+
+    Scope:
+      - regexp.QuoteMeta(key) before building the pattern.
+      - Move compilation into Config.Validate(), return the error.
+      - Enum-validate unmatched_behaviour; reject empty group_by_keys, which
+        today silently drops 100% of input with no error and no warning.
+      - Remove the duplicated defaults from Validate(); they already live in
+        createDefaultConfig.
+
+    Done when: a bad key gives a config error, not a panic; keys match
+    literally; Validate() returns errors rather than mutating.
+
+
+[3] #7  DONE - issue closed. Commit 1a1b6e7.
+        Bug: stale timer can evict the live group and silently drop records
+        https://github.com/agardnerIT/logs-to-spans-otel/issues/7
+
+    Outcome: logGroup gained a `flushed` flag. flushGroup is a no-op for an
+    already-flushed group, stamps `flushed` before touching anything, and only
+    deletes the map entry when c.groups[key] == group. addToGroup's split path
+    stamps `flushed` and stops both timers before removing the group from the
+    map. The flag also kills the duplicate emission from the second of the two
+    timers per group. Three tests added; the stale-callback one fails on the
+    pre-fix code. go vet + go test -race clean; CI green (run 36704296493).
+
+    Why here: silent record loss, small isolated fix, and it edits a function
+    that #11 and #15 also edit.
+
+    Core bug: Timer.Stop() returns false when the callback is already queued,
+    so the old group's callback runs flushGroup(key, oldGroup), which does an
+    unconditional `delete(c.groups, key)` - now pointing at the replacement
+    group. The live group is orphaned, its records are lost, and the span-link
+    chain breaks.
+
+    Scope:
+      - Guard the delete by identity: if c.groups[key] == group { delete }
+      - Stop timers before mutating the map.
+      - Optional: two time.AfterFunc per log record is heavy at volume;
+        consider one reused timer per group.
+      - context.Background() in the timer callbacks drops cancellation.
+
+    Done when: a regression test covers the stale-callback path, no orphaned
+    groups after a max_logs_per_trace split, `go test -race` passes.
+
+
+PHASE 3 - DECISION GATE (design only, no code)
+==============================================
+
+Do not start Phase 4 without this. Deciding is an hour; redoing it after the
+component is public is a week.
+
+[4] #8  DONE - decisions recorded, issue closed. Commit 51501af.
+        Bug: unmatched_behaviour is dead config and pass_through is not
+        implementable
+        https://github.com/agardnerIT/logs-to-spans-otel/issues/8
+
+    The field is declared, defaulted and validated but never read in
+    connector.go. ConsumeLogs unconditionally `continue`s past unmatched
+    records. And pass_through CANNOT work as documented: factory.go registers
+    only connector.WithLogsToTraces, so there is no logs consumer and the
+    connector cannot emit log records. Users choosing pass_through today get
+    silent drops - the worst outcome for someone who picked it specifically
+    to avoid data loss.
+
+    DECIDED: delete the option. pass_through needs connector.WithLogsToLogs
+    and a logs consumer - a second component identity that would make
+    correctness depend on how the user wired the pipeline, and that duplicates
+    what routingconnector already does. Filtering the stream up front with
+    filterprocessor is the documented answer and the recipe already existed.
+    Removing the key means strict decoding now rejects configs that set it
+    ("'logs_to_spans.Config' has invalid keys: unmatched_behaviour"), which is
+    the intended loud failure for a former no-op.
+
+    ALSO DECIDED HERE - contributes to #17:
+    Type naming. KEEP `logs_to_spans`. No user-facing rename.
+
+    The original claim in this file was WRONG. Checked the metadata.yaml of
+    every connector in contrib: the current convention is snake_case, and the
+    concatenated names are the DEPRECATED aliases.
+
+      directory                    type                deprecated_type
+      servicegraphconnector        service_graph       servicegraph
+      spanmetricsconnector         span_metrics        spanmetrics
+      signaltometricsconnector     signal_to_metrics   signaltometrics
+      metricsaslogsconnector       metrics_as_logs     metricsaslogs
+      otlpjsonconnector            otlp_json           otlpjson
+      roundrobinconnector          round_robin         roundrobin
+      slowsqlconnector             slow_sql            slowsql
+      grafanacloudconnector        grafana_cloud       grafanacloud
+      count/routing/sum/failover/exceptions -> single word (no separator
+      needed at all)
+
+    So logs_to_spans already matches the convention (cf. signal_to_metrics,
+    metrics_as_logs). Renaming to `logstospans` would pick exactly the shape
+    contrib is migrating away from, and break every existing user's config.
+    A "...processor" suffix is wrong outright: connectors are a distinct
+    component kind, not processors.
+
+    DIRECTORY convention is "type with underscores removed + connector":
+    span_metrics -> spanmetricsconnector, signal_to_metrics ->
+    signaltometricsconnector. So logs_to_spans -> connector/logstospansconnector.
+    Only the directory/module move in #17 remains; the type string is settled.
+
+    FROZEN CONFIG SURFACE - write metadata.yaml, config.schema.yaml and the
+    README table against exactly this and nothing else:
+
+      timeout, max_wait, max_logs_per_trace, group_by_keys, duration_keys,
+      end_span_duration, service_name
+
+    No unmatched_behaviour. Type string: logs_to_spans. Directory at donation:
+    connector/logstospansconnector.
+
+    Done when: both decisions are recorded on the issues, and the final config
+    option list is written down.
+
+
+PHASE 4 - FEATURES (in value order)
+===================================
+
+[5] #1  Add internal metrics (logs ingested, traces created, unmatched
+        dropped)
+        https://github.com/agardnerIT/logs-to-spans-otel/issues/1
+
+    First in this phase because #8, #11 and #7 all want counters from it.
+    Establish the meter before the features that need it. Wire via
+    component.TelemetrySettings.MeterProvider; convert to mdatagen-generated
+    during #17.
+
+
+[6] #14  Support extracting the group key from log attributes, not just the
+         body
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/14
+
+    Biggest adoption win. Today the group key can only come from the log body,
+    so every structured-logging user must insert a `transform` processor to
+    stringify the field back into the body first. The natural pipeline
+    (filelog + json_parser, or any OTLP-native app) already puts these fields
+    in attributes.
+
+    Scope: group_by_attributes, searched in order, with defined precedence
+    against group_by_keys. Document it. Update the README section that
+    currently teaches the transform-processor workaround.
+
+
+[7] #11  Bound group cardinality (max_groups / TTL eviction) to prevent
+         unbounded memory growth
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/11
+
+    DO NOT DEFER THIS ONE. "Unbounded memory under high-cardinality keys" is
+    the first question a reviewer asks about a stateful connector.
+    max_logs_per_trace bounds each group but nothing bounds the NUMBER of
+    groups - a per-request UUID key creates one map entry and two live timers
+    per distinct value until timeout.
+
+    Prior art to copy: connector/servicegraphconnector StoreConfig -
+    MaxItems, TTL, cache_loop, store_expiration_loop.
+
+    Consumes the counters from #1.
+
+
+[8] #12  Preserve source resource attributes and scope grouping by resource
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/12
+
+    processGroup writes only service.name; host.name, k8s.pod.name,
+    service.instance.id are all discarded. And grouping ignores the resource
+    entirely, so two different pods both logging userID=123 merge into one
+    trace. Needs a copy_resource_attributes option, a documented service.name
+    precedence rule, and at minimum a documented caveat about the merging.
+
+    Composes with #11's grouping change - consider doing the key construction
+    once for both.
+
+
+[9] #13  Link generated spans to the originating trace when log records carry
+         trace context
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/13
+
+    extractLogRecord reads only timestamp, duration, body and severity, so an
+    incoming trace_id/span_id is thrown away. Without this, the traces are
+    disconnected from the real traces they came from, which undercuts the
+    whole legacy-migration use case. Small change, high value.
+
+
+[10] #3  Configurable span naming instead of full log body
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/3
+
+    Already scoped on the issue (span_name_template with {body} / {severity}
+    / {truncated:N} ). Currently the span name is the entire log body - high
+    cardinality and potentially multi-KB. Independent of everything else.
+
+
+[11] #15  Move log record extraction out of the global mutex
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/15
+
+    MUST come after #7 and #11 - all three edit addToGroup.
+
+    extractLogRecord runs under c.mu, and for map/JSON bodies valueToString
+    calls AsString(), which serialises the body to a string while holding a
+    lock shared by all groups and timer callbacks. The connector is
+    effectively single-threaded.
+
+    Careful: the conversion must still be eager. plog.LogRecord is a
+    reference into upstream-owned pdata and must not be retained past
+    ConsumeLogs, since the connector correctly declares
+    Capabilities{MutatesData: false}. Add a benchmark, before and after.
+
+
+PHASE 5 - DONATION
+==================
+
+[12] #17  Contrib donation readiness: metadata.yaml, doc.go, Makefile,
+          license headers, module rename
+          https://github.com/agardnerIT/logs-to-spans-otel/issues/17
+
+    Do this at donation time, once the config surface is frozen in Phase 3 and
+    a sponsor exists. Most of it is throwaway effort in your own repo if the
+    donation stalls.
+
+    Required, currently missing: metadata.yaml, internal/metadata/, doc.go
+    (with //go:generate make mdatagen), Makefile (`include
+    ../../Makefile.Common`), config.schema.yaml, testdata/config.yaml,
+    generated_component_test.go, generated_package_test.go, .chloggen entry.
+
+    Also: module move to
+    github.com/open-telemetry/opentelemetry-collector-contrib/connector/logstospansconnector,
+    directory move, go directive and collector deps realigned with contrib
+    main (currently go 1.26.0 / v1.68.0 / v0.162.0; this repo is on
+    v1.60.0 / v0.154.0), add to versions.yaml and
+    cmd/otelcontribcol/builder-config.yaml, README status block + Supported
+    Pipeline Types table.
+
+    THREE PARTS OF #17 WORTH DOING EARLY ANYWAY - they cost nothing and pay
+    off regardless of whether the donation proceeds:
+      - License headers on every .go file. make addlicense requires them, and
+        they are free to add now:
+            // Copyright The OpenTelemetry Authors
+            // SPDX-License-Identifier: Apache-2.0
+      - go.uber.org/goleak in the test suite. Genuinely valuable on a
+        timer-heavy component, not box-ticking.
+      - The naming decision (already handled in Phase 3).
+
+    Note: coverage is already 93.7%, comfortably above the 80% target.
+
+
+IF YOU WANT TO MOVE FAST
+========================
+
+A credible donation does not need all 13. Ship this set and defer #12, #13,
+#3, #15:
+
+    #10 (DONE) -> #9 + #16 (DONE) -> #7 (DONE) -> #8 (DONE) -> #1 -> #14
+    -> #11 -> #17
+
+    Both phases 1-3 are now closed. Next actual work: #1 (internal metrics),
+    then #14, #11, #17.
+
+#11 is deliberately included rather than deferred - it is the one a reviewer
+will raise on the first pass.
+
+
+PER-SESSION CHECKLIST
+=====================
+
+Each session, one issue:
+
+    - Read the issue. It has the reproduction and the proposed fix.
+    - make the change
+    - go vet ./...
+    - go test -race -count=1 ./...
+    - update the README if any config key changed
+    - keep the issue body as the spec; do not widen scope mid-session
+    - push the branch and wait for CI to go GREEN before closing the issue.
+      A red run means the issue is NOT done - fix it in the same session.
+
+      FIXED (issue #18, commit eda3916): CI now builds the working tree
+      (replaces: in builder-config.yaml) and runs go vet + go test -race
+      before the OCB build, so a green run does prove the tests pass. Still
+      worth a local working-tree build for config-surface changes, and say
+      what you verified in the issue comment.
+
+        gh run list --limit 1
+        gh run watch <run-id> --exit-status
+
+    - only then close the issue (gh issue close <N>) with a comment that
+      states the commit(s) and what was verified.
+
+Session prompt to paste:
+
+    Work on issue #<N> in this repo. Read the issue body and the files it
+    references, implement the fix and its tests, then run go vet ./... and
+    go test -race -count=1 ./... . Update the README if any config key
+    changed. Push, and confirm CI is green before closing the issue. Do not
+    touch anything outside this issue's scope.
+
+
+KNOWN GOTCHAS - DO NOT REDISCOVER
+=================================
+
+Go toolchain:
+  - go.mod declares `go 1.25.0`. The Go 1.25.0 LINKER cannot link
+    filterprocessor v0.154.0: it fails with
+    "relocation target ...WithConditionConverter... not defined".
+    This is patch-specific and fixed by later 1.25 patches - go1.25.14 and
+    1.26.x link it fine.
+  - Therefore .github/workflows/ci.yaml pins `go-version: '1.25.x'` with
+    `check-latest: true`. Do NOT switch it back to `go-version-file: go.mod`
+    until go.mod's directive is bumped past 1.25.0 (that is part of #17).
+  - OCB is at ~/tools/ocb (v0.154.0). Build/verify:
+        ~/tools/ocb --config builder-config.yaml
+        ./otelcol-dist/otelcol-logs-to-spans validate --config collector.yaml
+
+Collector runtime:
+  - Default telemetry binds localhost:8888, so two collectors cannot run at
+    once: "binding address localhost:8888 ... address already in use".
+    Kill leftovers with `pkill -9 -f otelcol-logs-to-spans`.
+  - `cd x && ./binary ... &` backgrounds the SUBSHELL, so `kill $!` does not
+    stop the collector. Use `( exec ./binary ... ) &` so $! is the real PID.
+  - Time-to-first-trace needs ~10s (default timeout: 5s). The debug exporter
+    then prints ResourceSpans blocks.
+
+Release / config surface:
+  - The Go module proxy caches versions immutably. NEVER move or re-create a
+    tag that has already been fetched (do not retag v0.4.0). Cut a new patch
+    version instead.
+  - Only collector.yaml is a shipped example config now. If you add another
+    *.yaml example, CI picks it up automatically.
+
+CI verification (issue #18 - FIXED, commit eda3916):
+  - builder-config.yaml now has
+        replaces:
+          - github.com/agardnerIT/logs-to-spans-otel => ../
+    (path is relative to output_path ./otelcol-dist, so ../ is the repo root)
+    and ci.yaml runs go vet ./... and go test -race -count=1 ./... before the
+    OCB build. CI compiles the working tree and the tests gate the build.
+  - Local working-tree build + config check:
+        ~/tools/ocb --config builder-config.yaml
+        ./otelcol-dist/otelcol-logs-to-spans validate --config collector.yaml
+    Confirm otelcol-dist/go.mod contains the replace directive before trusting
+    the binary; if it is missing you are testing the published tag.
