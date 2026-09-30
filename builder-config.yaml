@@ -15,16 +15,16 @@ replaces:
   - github.com/agardnerIT/logs-to-spans-otel => ../
 
 exporters:
-  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.154.0"
-  - gomod: "go.opentelemetry.io/collector/exporter/otlpexporter v0.154.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.162.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/otlpexporter v0.162.0"
 
 receivers:
-  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.154.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.162.0"
 
 processors:
-  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.154.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.162.0"
 
 providers:
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.48.0"
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.48.0"
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.48.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.68.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.68.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.68.0"

@@ -1,0 +1,36 @@
+description: Config defines the configuration for the logs_to_spans connector.
+type: object
+properties:
+  duration_keys:
+    description: DurationKeys is the ordered list of attribute names that hold an explicit span duration.
+    type: array
+    items:
+      type: string
+  end_span_duration:
+    description: EndSpanDuration is the duration given to the last span in a group when neither an explicit duration nor a following log provides an end time.
+    x-customType: time.duration
+  group_by_attributes:
+    description: GroupByAttributes is the ordered list of log attribute names to use as the group key. Attribute matches take precedence over GroupByKeys.
+    type: array
+    items:
+      type: string
+  group_by_keys:
+    description: GroupByKeys is the ordered list of keys to look for in the log body, as structured map keys or as key=value pairs. At least one of GroupByKeys or GroupByAttributes must be set.
+    type: array
+    items:
+      type: string
+  max_groups:
+    description: MaxGroups bounds the number of buffered groups. When a new group would exceed it, the least recently updated group is flushed early. 0 disables the bound.
+    type: integer
+  max_logs_per_trace:
+    description: MaxLogsPerTrace caps the number of log records in one trace. When a group reaches the cap it is flushed as a trace and a follow-on group starts with a span link back to it. 0 disables the cap.
+    type: integer
+  max_wait:
+    description: MaxWait is the maximum time a group may stay open, measured from its first log record, regardless of later activity.
+    x-customType: time.duration
+  service_name:
+    description: ServiceName is written to the service.name resource attribute of every emitted trace.
+    type: string
+  timeout:
+    description: Timeout is the inactivity period after which a group is flushed. Each new log record in a group resets it.
+    x-customType: time.duration

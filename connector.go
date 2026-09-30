@@ -1,3 +1,6 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package logs_to_spans
 
 import (
@@ -14,6 +17,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
+
+	"github.com/agardnerIT/logs-to-spans-otel/internal/metadata"
 )
 
 type logsToSpansConnector struct {
@@ -24,7 +29,7 @@ type logsToSpansConnector struct {
 	mu             sync.Mutex
 	stopped        bool
 	compiledRegex  []*regexp.Regexp
-	telemetry      *telemetry
+	telemetry      *metadata.TelemetryBuilder
 }
 
 type logGroup struct {
@@ -77,10 +82,10 @@ func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) er
 			sl := rl.ScopeLogs().At(j)
 			for k := 0; k < sl.LogRecords().Len(); k++ {
 				lr := sl.LogRecords().At(k)
-				c.telemetry.logsIngested.Add(ctx, 1)
+				c.telemetry.ConnectorLogsToSpansLogsIngested.Add(ctx, 1)
 				key := c.extractGroupKey(lr)
 				if key == "" {
-					c.telemetry.unmatchedDropped.Add(ctx, 1)
+					c.telemetry.ConnectorLogsToSpansUnmatchedDropped.Add(ctx, 1)
 					continue
 				}
 				c.addToGroup(key, lr)
@@ -114,6 +119,10 @@ func (c *logsToSpansConnector) Shutdown(ctx context.Context) error {
 	for _, g := range groups {
 		c.processGroup(ctx, g)
 	}
+
+	// Unregister the active_groups observable gauge callback so the meter does
+	// not retain the connector after shutdown.
+	c.telemetry.Shutdown()
 	return nil
 }
 
@@ -241,7 +250,7 @@ func (c *logsToSpansConnector) emitEvictedGroup(group *logGroup) {
 	if group == nil {
 		return
 	}
-	c.telemetry.groupsEvicted.Add(context.Background(), 1)
+	c.telemetry.ConnectorLogsToSpansGroupsEvicted.Add(context.Background(), 1)
 	c.logger.Debug("evicted least recently updated group: max_groups reached",
 		zap.String("group_key", group.key),
 		zap.Int("max_groups", c.config.MaxGroups),
@@ -449,7 +458,7 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 		zap.Int("log_count", len(group.records)),
 	)
 
-	c.telemetry.tracesCreated.Add(ctx, 1)
+	c.telemetry.ConnectorLogsToSpansTracesCreated.Add(ctx, 1)
 
 	if err := c.tracesConsumer.ConsumeTraces(ctx, td); err != nil {
 		c.logger.Error("failed to consume traces", zap.Error(err))

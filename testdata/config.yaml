@@ -1,0 +1,25 @@
+# Sample configurations for the logs_to_spans connector. Every entry here is
+# unmarshalled into Config and validated by TestConfigFromTestdata, so this file
+# doubles as executable documentation of the option surface. The full
+# reference lives in README.md.
+
+# The minimum useful configuration: group logs by a key found in the body.
+default:
+  group_by_keys: [userID]
+
+# Attributes-only grouping. No body regex is compiled; logs must carry the
+# key as a structured attribute.
+attributes_only:
+  group_by_attributes: [user.id]
+
+# Every documented option set explicitly.
+all_options:
+  timeout: 5s
+  max_wait: 30s
+  max_logs_per_trace: 100
+  max_groups: 1000
+  group_by_keys: [userID, user_id]
+  group_by_attributes: [user.id]
+  duration_keys: [duration]
+  end_span_duration: 500ms
+  service_name: my-app

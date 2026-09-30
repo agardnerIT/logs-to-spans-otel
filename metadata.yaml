@@ -1,0 +1,71 @@
+display_name: Logs to Spans Connector
+type: logs_to_spans
+# Pin the instrumentation scope of the internal metrics. Without this, the
+# scope is derived from the containing directory and moves with the directory
+# rename at donation.
+scope_name: github.com/agardnerIT/logs-to-spans-otel
+
+status:
+  class: connector
+  stability:
+    development: [logs_to_traces]
+  distributions: [contrib]
+  codeowners:
+    active: [agardnerIT]
+    # TODO(donation): a donation needs a sponsor (approver/maintainer from a
+    # different company) and three codeowners, at least one of whom is an
+    # approver/maintainer. Replace this list with the confirmed handles before
+    # opening the contrib pull request.
+
+tests:
+  config:
+    timeout: 5s
+    max_wait: 30s
+    max_logs_per_trace: 100
+    max_groups: 1000
+    group_by_keys: [userID]
+    end_span_duration: 500ms
+    service_name: test-service
+
+telemetry:
+  metrics:
+    connector_logs_to_spans_active_groups:
+      enabled: true
+      description: Number of log groups currently buffered by the connector.
+      unit: "{group}"
+      gauge:
+        value_type: int
+        async: true
+      stability: development
+    connector_logs_to_spans_groups_evicted:
+      enabled: true
+      description: Number of groups flushed early because max_groups was reached.
+      unit: "{group}"
+      sum:
+        value_type: int
+        monotonic: true
+      stability: development
+    connector_logs_to_spans_logs_ingested:
+      enabled: true
+      description: Number of log records consumed by the connector.
+      unit: "{log_record}"
+      sum:
+        value_type: int
+        monotonic: true
+      stability: development
+    connector_logs_to_spans_traces_created:
+      enabled: true
+      description: Number of traces emitted by the connector.
+      unit: "{trace}"
+      sum:
+        value_type: int
+        monotonic: true
+      stability: development
+    connector_logs_to_spans_unmatched_dropped:
+      enabled: true
+      description: Number of log records dropped because no group_by_keys or group_by_attributes entry matched.
+      unit: "{log_record}"
+      sum:
+        value_type: int
+        monotonic: true
+      stability: development

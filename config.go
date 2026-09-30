@@ -1,3 +1,6 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package logs_to_spans
 
 import (
@@ -7,16 +10,46 @@ import (
 	"time"
 )
 
+// Config defines the configuration for the logs_to_spans connector.
 type Config struct {
-	Timeout           time.Duration `mapstructure:"timeout"`
-	MaxWait           time.Duration `mapstructure:"max_wait"`
-	MaxLogsPerTrace   int           `mapstructure:"max_logs_per_trace"`
-	MaxGroups         int           `mapstructure:"max_groups"`
-	GroupByKeys       []string      `mapstructure:"group_by_keys"`
-	GroupByAttributes []string      `mapstructure:"group_by_attributes"`
-	DurationKeys      []string      `mapstructure:"duration_keys"`
-	EndSpanDuration   time.Duration `mapstructure:"end_span_duration"`
-	ServiceName       string        `mapstructure:"service_name"`
+	// Timeout is the inactivity period after which a group is flushed. Each new
+	// log record in a group resets it.
+	Timeout time.Duration `mapstructure:"timeout"`
+
+	// MaxWait is the maximum time a group may stay open, measured from its first
+	// log record, regardless of later activity.
+	MaxWait time.Duration `mapstructure:"max_wait"`
+
+	// MaxLogsPerTrace caps the number of log records in one trace. When a group
+	// reaches the cap it is flushed as a trace and a follow-on group starts with
+	// a span link back to it. 0 disables the cap.
+	MaxLogsPerTrace int `mapstructure:"max_logs_per_trace"`
+
+	// MaxGroups bounds the number of buffered groups. When a new group would
+	// exceed it, the least recently updated group is flushed early. 0 disables
+	// the bound.
+	MaxGroups int `mapstructure:"max_groups"`
+
+	// GroupByKeys is the ordered list of keys to look for in the log body, as
+	// structured map keys or as key=value pairs. At least one of GroupByKeys or
+	// GroupByAttributes must be set.
+	GroupByKeys []string `mapstructure:"group_by_keys"`
+
+	// GroupByAttributes is the ordered list of log attribute names to use as the
+	// group key. Attribute matches take precedence over GroupByKeys.
+	GroupByAttributes []string `mapstructure:"group_by_attributes"`
+
+	// DurationKeys is the ordered list of attribute names that hold an explicit
+	// span duration.
+	DurationKeys []string `mapstructure:"duration_keys"`
+
+	// EndSpanDuration is the duration given to the last span in a group when
+	// neither an explicit duration nor a following log provides an end time.
+	EndSpanDuration time.Duration `mapstructure:"end_span_duration"`
+
+	// ServiceName is written to the service.name resource attribute of every
+	// emitted trace.
+	ServiceName string `mapstructure:"service_name"`
 }
 
 // validateAttributeKeys rejects empty entries in group_by_attributes. An empty
