@@ -1,14 +1,14 @@
 dist:
   name: otelcol-logs-to-spans
-  version: 0.4.0
+  version: 0.5.0
   description: Custom OpenTelemetry Collector distribution with logs-to-spans connector
   output_path: ./otelcol-dist
 
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.4.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.5.0"
     name: "logs_to_spans"
 
-# Build the connector from the working tree, not the published v0.4.0 tag.
+# Build the connector from the working tree, not the published v0.5.0 tag.
 # The path is resolved relative to output_path (./otelcol-dist), so ../ is the
 # repo root. Without this, OCB downloads the last release and CI tests stale code.
 replaces:

@@ -379,7 +379,7 @@ Add this connector to your OCB `builder-config.yaml`:
 
 ```yaml
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.4.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.5.0"
     name: "logs_to_spans"
 
 exporters:
@@ -435,6 +435,19 @@ The test suite covers:
 - Source resource attribute copying, `group_by_resource_attributes` scoping, and `service.name` precedence across multiple resources
 - Unmatched records being dropped without creating a trace
 - Concurrent consumption during splits and timer callbacks (run under `-race`)
+- Eager extraction: mutating a source log record after `ConsumeLogs` returns does not change the emitted span
+
+### Benchmarks
+
+```sh
+go test -run '^$' -bench . -benchmem ./...
+```
+
+`benchmark_test.go` measures the per-record path on a structured (Map) body:
+
+- `BenchmarkConsumeLogsStructured` — single caller, the cost of extraction itself
+- `BenchmarkConsumeLogsStructuredParallel` — concurrent callers against one connector, where the global mutex used to serialise every core ([#15](https://github.com/agardnerIT/logs-to-spans-otel/issues/15))
+- `BenchmarkExtractLogRecord` — the extraction the fix moved out of the critical section, measured on its own
 
 ### Quick start with filelog
 
@@ -479,8 +492,9 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ## Changelog
 
-### Unreleased
+### v0.5.0
 
+- Removed the per-record log body conversion from the connector's global mutex, so the connector no longer serialises every core on one lock ([#15](https://github.com/agardnerIT/logs-to-spans-otel/issues/15)). `extractLogRecord` (body and severity conversion, time and duration parsing, trace-context extraction) now runs in `ConsumeLogs` before `addToGroup` takes `c.mu`; only map/list manipulation and timer bookkeeping stay under the lock. For a structured (Map) body the old path ran `Value.AsString()` — a full JSON serialisation of the body — while holding a lock shared by every group and timer callback. The conversion remains eager and the resulting `logRecord` is an immutable copy, so no `pdata` reference is retained past `ConsumeLogs` (the connector declares `MutatesData: false`). Three benchmarks were added in `benchmark_test.go`: a single-goroutine baseline, a `RunParallel` case over one connector, and an isolated `extractLogRecord` case. On an 8-core Apple M2 the parallel case improved from ~330k to ~555k logs/sec (~1.7x, `-benchtime=3s`); single-goroutine throughput is unchanged at ~415k logs/sec.
 - Added `span_name_template` (default `"{body}"`) to control the name of generated spans ([#3](https://github.com/agardnerIT/logs-to-spans-otel/issues/3)). The name was previously always the full log body, which is high-cardinality and can be multi-KB. Placeholders: `{body}` (full log body), `{severity}` (the record's severity text) and `{truncated:N:body}` (the first N characters of the body, counted in characters rather than bytes). An unknown or malformed placeholder is a startup error; a template that renders empty (for example `{severity}` on a record with no severity) falls back to the body so the span name is never empty. The full body remains available as the `log.body` span attribute.
 - Spans now link back to the originating trace when a log record carries trace context ([#13](https://github.com/agardnerIT/logs-to-spans-otel/issues/13)):
   - Record-level `trace_id` / `span_id` set by the receiver, a `filelog` `trace_parser` operator, or an OTLP-native application is used directly and wins over attributes.
