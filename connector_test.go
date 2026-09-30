@@ -115,7 +115,7 @@ func sendLogsWithMultipleResources(t *testing.T, conn connector.Logs, resources 
 // resource attributes, matching a source that sets none. Resource-aware cases
 // call addToGroup directly with a populated pcommon.Map.
 func addTestRecord(c *logsToSpansConnector, key string, lr plog.LogRecord) {
-	c.addToGroup(key, pcommon.NewMap(), lr)
+	c.addToGroup(key, pcommon.NewMap(), extractLogRecord(lr, c.config))
 }
 
 func TestConfigDefaults(t *testing.T) {
@@ -997,6 +997,55 @@ func TestCapabilitiesMutatesDataFalse(t *testing.T) {
 
 	c := conn.(*logsToSpansConnector)
 	assert.False(t, c.Capabilities().MutatesData)
+}
+
+// TestConsumeLogsDoesNotRetainSourcePdata pins the eager-copy contract behind
+// the mutex fix: ConsumeLogs must turn the log record into an immutable
+// logRecord immediately, because plog values are views into pdata the upstream
+// owner may reuse after ConsumeLogs returns (the connector declares
+// MutatesData: false). Rewriting the source body and severity after the call
+// must not change the emitted span.
+func TestConsumeLogsDoesNotRetainSourcePdata(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	// Keep the group buffered so the flush happens after the source is mutated.
+	cfg.Timeout = time.Hour
+	cfg.MaxWait = time.Hour
+	conn := createTestConnector(t, cfg, sink)
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	sl := rl.ScopeLogs().AppendEmpty()
+	lr := sl.LogRecords().AppendEmpty()
+	body := lr.Body().SetEmptyMap()
+	body.PutStr("user", "u-1")
+	body.PutStr("message", "original message")
+	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+	lr.SetSeverityText("INFO")
+
+	require.NoError(t, conn.ConsumeLogs(context.Background(), ld))
+
+	// Overwrite the source in place, the way a receiver reusing its batch
+	// buffers would once ConsumeLogs has returned.
+	lr.Body().Map().PutStr("message", "mutated message")
+	lr.SetSeverityText("DEBUG")
+
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+	spans := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	require.Equal(t, 1, spans.Len())
+
+	bodyAttr, ok := spans.At(0).Attributes().Get("log.body")
+	require.True(t, ok)
+	assert.Contains(t, bodyAttr.Str(), "original message")
+	assert.NotContains(t, bodyAttr.Str(), "mutated message")
+
+	sevAttr, ok := spans.At(0).Attributes().Get("log.severity")
+	require.True(t, ok)
+	assert.Equal(t, "INFO", sevAttr.Str())
 }
 
 func TestStartReturnsNil(t *testing.T) {

@@ -103,7 +103,17 @@ func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) er
 					c.telemetry.ConnectorLogsToSpansUnmatchedDropped.Add(ctx, 1)
 					continue
 				}
-				c.addToGroup(key, resource, lr)
+
+				// Extract the record before taking the lock. The body/severity
+				// conversion is the dominant per-record cost (for a Map body
+				// valueToString serialises it to JSON while it runs), and running it
+				// inside c.mu serialised every core against all groups and timer
+				// callbacks. The result is an immutable copy, so addToGroup only does
+				// map/list work under the lock. Extraction must stay eager: plog values
+				// are views into upstream-owned pdata and must not be retained past
+				// ConsumeLogs (the connector declares MutatesData: false).
+				rec := extractLogRecord(lr, c.config)
+				c.addToGroup(key, resource, rec)
 			}
 		}
 	}
@@ -141,7 +151,7 @@ func (c *logsToSpansConnector) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (c *logsToSpansConnector) addToGroup(key string, resource pcommon.Map, lr plog.LogRecord) {
+func (c *logsToSpansConnector) addToGroup(key string, resource pcommon.Map, rec *logRecord) {
 	c.mu.Lock()
 
 	if c.stopped {
@@ -172,7 +182,7 @@ func (c *logsToSpansConnector) addToGroup(key string, resource pcommon.Map, lr p
 	}
 
 	group.lastUpdated = time.Now()
-	group.records = append(group.records, extractLogRecord(lr, c.config))
+	group.records = append(group.records, rec)
 
 	if group.timer != nil {
 		group.timer.Stop()
