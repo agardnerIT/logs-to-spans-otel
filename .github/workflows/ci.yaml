@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  validate-configs:
+    name: Build collector and validate example configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install OpenTelemetry Collector Builder (ocb)
+        run: go install go.opentelemetry.io/collector/cmd/builder@v0.154.0
+
+      - name: Build the collector from builder-config.yaml
+        run: $(go env GOPATH)/bin/builder --config builder-config.yaml
+
+      - name: Validate every shipped example config
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for cfg in *.yaml; do
+            if [ "$cfg" = "builder-config.yaml" ]; then
+              continue
+            fi
+            echo "::group::validate --config $cfg"
+            ./otelcol-dist/otelcol-logs-to-spans validate --config "$cfg"
+            echo "::endgroup::"
+          done

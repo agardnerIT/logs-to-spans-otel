@@ -4,24 +4,10 @@ receivers:
     start_at: beginning
     operators:
       - type: regex_parser
-        regex: '^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s+(?P<body>.*)$'
+        regex: '^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(?P<body>.*)$'
         timestamp:
           parse_from: attributes.ts
-          layout: '2006-01-02T15:04:05'
-
-processors:
-  filter/include_matched:
-    logs:
-      include:
-        match_type: regexp
-        bodies:
-          - ".*(user|userID|user_id)=\\S+.*"
-  filter/exclude_matched:
-    logs:
-      exclude:
-        match_type: regexp
-        bodies:
-          - ".*(user|userID|user_id)=\\S+.*"
+          layout: '%Y-%m-%d %H:%M:%S'
 
 connectors:
   logs_to_spans:
@@ -53,8 +39,3 @@ service:
     traces:
       receivers: [logs_to_spans]
       exporters: [debug, otlp/jaeger]
-
-
-
-
-

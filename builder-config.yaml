@@ -5,7 +5,7 @@ dist:
   output_path: ./otelcol-dist
 
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.2.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.4.0"
     name: "logs_to_spans"
 
 exporters:
