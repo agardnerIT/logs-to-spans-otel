@@ -210,14 +210,34 @@ component is public is a week.
 PHASE 4 - FEATURES (in value order)
 ===================================
 
-[5] #1  Add internal metrics (logs ingested, traces created, unmatched
+[5] #1  DONE - issue closed. Commit d1018bc.
+        Add internal metrics (logs ingested, traces created, unmatched
         dropped)
         https://github.com/agardnerIT/logs-to-spans-otel/issues/1
 
+    Outcome: telemetry.go builds three Int64Counters from
+    component.TelemetrySettings.MeterProvider via a small newTelemetry
+    helper. MeterProvider nil falls back to noop, so tests and embedders that
+    build Settings without one do not panic. Counters:
+      otelcol_connector_logs_to_spans_logs_ingested     (per record consumed)
+      otelcol_connector_logs_to_spans_traces_created    (per trace emitted)
+      otelcol_connector_logs_to_spans_unmatched_dropped (key == "")
+    The connector only exposes unmatched drops as a number now - #8 removed
+    unmatched_behaviour, so this is the sole visibility into them.
+
+    Tests: 4 new, using go.opentelemetry.io/otel/sdk/metric ManualReader to
+    assert exact values (new test-only dep: sdk/metric + sdk). No config
+    surface change.
+
+    Verified: vet + go test -race clean; OCB working-tree build (replace
+    present) + validate collector.yaml; end-to-end example run reports
+    logs_ingested 9 / unmatched_dropped 3 / traces_created 3 on :8888/metrics,
+    consistent with input.log; CI run 36707489938 green.
+    README gained "Produced metrics" table + Changelog entry.
+
     First in this phase because #8, #11 and #7 all want counters from it.
-    Establish the meter before the features that need it. Wire via
-    component.TelemetrySettings.MeterProvider; convert to mdatagen-generated
-    during #17.
+    Establish the meter before the features that need it. Convert to
+    mdatagen-generated during #17.
 
 
 [6] #14  Support extracting the group key from log attributes, not just the
@@ -341,11 +361,11 @@ IF YOU WANT TO MOVE FAST
 A credible donation does not need all 13. Ship this set and defer #12, #13,
 #3, #15:
 
-    #10 (DONE) -> #9 + #16 (DONE) -> #7 (DONE) -> #8 (DONE) -> #1 -> #14
-    -> #11 -> #17
+    #10 (DONE) -> #9 + #16 (DONE) -> #7 (DONE) -> #8 (DONE) -> #1 (DONE)
+    -> #14 -> #11 -> #17
 
-    Both phases 1-3 are now closed. Next actual work: #1 (internal metrics),
-    then #14, #11, #17.
+    Both phases 1-3 are closed and #1 is now in. Next actual work: #14
+    (group_by_attributes), then #11, #17.
 
 #11 is deliberately included rather than deferred - it is the one a reviewer
 will raise on the first pass.
