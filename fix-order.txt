@@ -445,20 +445,49 @@ PHASE 4 - FEATURES (in value order)
     output wart. #15 is the remaining optional Phase 4 item.
 
 
-[11] #15  Move log record extraction out of the global mutex
+[11] #15  DONE - issue closed. Commit 9d2c911.
+         Move log record extraction out of the global mutex
          https://github.com/agardnerIT/logs-to-spans-otel/issues/15
 
-    MUST come after #7 and #11 - all three edit addToGroup.
+    This was the last Phase 4 item and it came after #7 and #11 as planned -
+    all three edit addToGroup, so the refactors landed in order with no
+    conflict.
 
-    extractLogRecord runs under c.mu, and for map/JSON bodies valueToString
-    calls AsString(), which serialises the body to a string while holding a
-    lock shared by all groups and timer callbacks. The connector is
-    effectively single-threaded.
+    What landed:
 
-    Careful: the conversion must still be eager. plog.LogRecord is a
-    reference into upstream-owned pdata and must not be retained past
-    ConsumeLogs, since the connector correctly declares
-    Capabilities{MutatesData: false}. Add a benchmark, before and after.
+      - ConsumeLogs calls extractLogRecord(lr, c.config) before addToGroup,
+        and addToGroup now takes the resulting *logRecord instead of the
+        plog.LogRecord. Only map/list manipulation (buildMapKey, the groups
+        map splice, eviction, timer bookkeeping) is left under c.mu. No pdata
+        body traversal and no JSON serialisation run under the lock any more.
+      - The conversion stays eager. addTestRecord in the test suite extracts
+        before calling addToGroup the same way the hot path does.
+      - TestConsumeLogsDoesNotRetainSourcePdata pins the MutatesData: false
+        contract: the source body and severity are overwritten after
+        ConsumeLogs returns, then the group is flushed, and the emitted span
+        must still hold the original values.
+      - benchmark_test.go: BenchmarkConsumeLogsStructured (single caller),
+        BenchmarkConsumeLogsStructuredParallel (RunParallel against one
+        connector) and BenchmarkExtractLogRecord (the moved cost on its own),
+        all on a 10-field Map body.
+
+    Results on an 8-core Apple M2, -benchtime=3s, go1.26.4, with a nop traces
+    consumer so the downstream sink lock does not mask the connector lock:
+
+      benchmark                                before        after
+      BenchmarkConsumeLogsStructured           417k logs/s   415k logs/s
+      BenchmarkConsumeLogsStructuredParallel   332k logs/s   555k logs/s
+
+    Sequential throughput is unchanged (the lock was uncontended there); the
+    parallel case is ~1.7x higher. Before the fix the parallel number was
+    below the sequential number - the clearest possible statement of
+    "effectively single-threaded" - and it is now above it. The parallel case
+    still does not scale 8x because the remaining critical section (a timer
+    Stop + AfterFunc per record) is inherently serial; that is a separate
+    follow-up, not part of #15.
+
+    Verified: go vet ./..., go test -race -count=1 ./... (all packages), and
+    the OCB build + collector.yaml validate for the 0.5.0 release.
 
 
 PHASE 5 - DONATION
@@ -528,18 +557,20 @@ PHASE 5 - DONATION
 IF YOU WANT TO MOVE FAST
 ========================
 
-A credible donation does not need all 13. Ship this set and defer #15:
+A credible donation does not need all 13. Ship this set:
 
     #10 (DONE) -> #9 + #16 (DONE) -> #7 (DONE) -> #8 (DONE) -> #1 (DONE)
-    -> #14 (DONE) -> #11 (DONE) -> #12 (DONE) -> #13 (DONE) -> #3 (DONE) -> #17
+    -> #14 (DONE) -> #11 (DONE) -> #12 (DONE) -> #13 (DONE) -> #3 (DONE)
+    -> #17 -> #15 (DONE)
 
-    Both phases 1-3 are closed and six of the seven Phase 4 issues are done
-    (#1, #14, #11, #12, #13, #3). #17's code side is done (see [12]); the
+    Both phases 1-3 are closed and every Phase 4 issue is now done (#1, #14,
+    #11, #12, #13, #3, #15). #17's code side is done (see [12]); the only
     remaining work is the module/directory move at donation plus the
-    sponsor/codeowners. Optionally #15 if the donation has to wait.
+    sponsor/codeowners.
 
-#11 is deliberately included rather than deferred - it is the one a reviewer
-will raise on the first pass.
+#15 was optional and is now done too, so nothing in the issue list is
+outstanding on the code side. #11 is deliberately included rather than
+deferred - it is the one a reviewer will raise on the first pass.
 
 
 DOCUMENTATION - EVERY SESSION, NO EXCEPTIONS
