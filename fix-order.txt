@@ -334,6 +334,46 @@ PHASE 4 - FEATURES (in value order)
     once for both.
 
 
+[8] #12  DONE - issue closed. Commit daf17a5.
+         Preserve source resource attributes and scope grouping by resource
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/12
+
+    Outcome: two new options. `copy_resource_attributes` (default true)
+    deep-copies the first record's resource attributes onto the emitted
+    trace's resource; the copy is taken in ConsumeLogs while the upstream
+    pdata is still valid (the connector declares MutatesData: false).
+    `group_by_resource_attributes` scopes a group by resource attribute
+    values, so the same key from two pods/services makes two traces instead
+    of one. The map key is length-prefixed (no separator collisions) and
+    group.key stays the extracted value, never the scope. Key construction
+    lives in one buildMapKey helper shared with #11's recency/eviction path.
+
+    service.name precedence, documented and tested: an explicit service_name
+    wins; otherwise the source service.name is preserved; otherwise
+    logs-to-spans. This makes service_name an override rather than a default
+    and changes its default to "" (empty is no longer a validation error).
+    Every emitted trace still has a service.name.
+
+    Documented the previously silent collapsing: without resource scoping a
+    group can hold records from several resources, and the first record's
+    resource wins. Split-replacement groups inherit the resource of the
+    group they replace.
+
+    Tests: 9 new - copying on/off, source service.name preserved, explicit
+    override, first-resource-wins when merging, resource-scoped separation,
+    missing-attribute collapse, split resource inheritance, empty
+    resource-attribute key rejected. Coverage 96.2%. go vet + go test -race
+    clean. OCB v0.162.0 working-tree build + validate collector.yaml; a
+    config with the new keys validates and a bogus key is rejected; 15s
+    end-to-end run still emits 3 traces with service.name my-app.
+
+    README: new "Scoping groups by resource" section, two reference rows,
+    produced-spans resource row, example, Unreleased changelog. Regenerated
+    config.schema.yaml with schemagen; testdata + metadata samples updated.
+
+    Fourth in Phase 4. #15 (and #13's trace context) still follow; #15 must
+    build on this addToGroup shape.
+
 [9] #13  Link generated spans to the originating trace when log records carry
          trace context
          https://github.com/agardnerIT/logs-to-spans-otel/issues/13
@@ -435,16 +475,16 @@ PHASE 5 - DONATION
 IF YOU WANT TO MOVE FAST
 ========================
 
-A credible donation does not need all 13. Ship this set and defer #12, #13,
-#3, #15:
+A credible donation does not need all 13. Ship this set and defer #13, #3,
+#15:
 
     #10 (DONE) -> #9 + #16 (DONE) -> #7 (DONE) -> #8 (DONE) -> #1 (DONE)
     -> #14 (DONE) -> #11 (DONE) -> #17
 
-    Both phases 1-3 are closed and Phase 4 is three-quarters in. #17's code
-    side is now done (see [12]); the remaining work is the module/directory
-    move at donation plus the sponsor/codeowners. Optionally #12/#13/#3/#15 if
-    the donation has to wait.
+    Both phases 1-3 are closed and four of the seven Phase 4 issues are done
+    (#1, #14, #11, #12). #17's code side is now done (see [12]); the remaining
+    work is the module/directory move at donation plus the
+    sponsor/codeowners. Optionally #13/#3/#15 if the donation has to wait.
 
 #11 is deliberately included rather than deferred - it is the one a reviewer
 will raise on the first pass.
