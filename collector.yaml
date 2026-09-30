@@ -5,6 +5,9 @@ receivers:
     operators:
       - type: regex_parser
         regex: '^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(?P<body>.*)$'
+        # Most lines in input.log have no timestamp prefix. send_quiet keeps
+        # the entry (body unchanged) without logging an error per line.
+        on_error: send_quiet
         timestamp:
           parse_from: attributes.ts
           layout: '%Y-%m-%d %H:%M:%S'
