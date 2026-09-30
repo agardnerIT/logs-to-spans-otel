@@ -67,6 +67,29 @@ The connector reads explicit span durations from log attributes by checking each
 
 Logs without a valid duration attribute fall back to the default behaviour: each span's duration is the time delta to the next log, and the last span in a trace uses `end_span_duration`.
 
+### Produced spans
+
+Each flushed group becomes one `ResourceSpans` batch:
+
+| Element | Value |
+|---------|-------|
+| Resource attribute | `service.name` = `service_name` |
+| Scope name | `logs-to-spans` |
+| Trace ID | random, generated when the group is flushed. A group split by `max_logs_per_trace` gets its own trace ID and is linked back to the previous one. |
+| Span name | the full log body. High cardinality by nature — configurable naming is tracked in [#3](https://github.com/agardnerIT/logs-to-spans-otel/issues/3). |
+| Span kind | `Internal` |
+| Span start | the log's `Timestamp`, falling back to `ObservedTimestamp` when `Timestamp` is unset |
+| Span end | `start + duration`, where duration is `duration_keys` → time delta to the next log → `end_span_duration` for the last span |
+| Span attributes | `log.body` (always), `log.severity` (only when non-empty), `group.key` |
+| Parent | the preceding span in the same trace; the first span has no parent |
+| Links | the first span of a follow-on group links to the last span of the previous group's trace, so a group split by `max_logs_per_trace` stays connected |
+
+Spans are sorted by start timestamp before emission, regardless of the order the logs arrived in.
+
+> **Caveat — grouping ignores resource attributes.** Two different pods that log the same extracted value (say `userID=123`) merge into a single trace. Preserving resource attributes and scoping the group key by resource is tracked in [#12](https://github.com/agardnerIT/logs-to-spans-otel/issues/12).
+
+> **The connector does not mutate its input.** It declares `Capabilities{MutatesData: false}` and copies everything it needs out of each log record before the upstream batch is released.
+
 ## Configuration
 
 ### Reference
@@ -249,6 +272,9 @@ The test suite covers:
 - Flush-on-shutdown
 - Service name propagation
 - `max_logs_per_trace` limit, span links, and chain behaviour
+- Stale-timer safety after a `max_logs_per_trace` split, and flush idempotency
+- Unmatched records being dropped without creating a trace
+- Concurrent consumption during splits and timer callbacks (run under `-race`)
 
 ### Quick start with filelog
 
@@ -279,6 +305,17 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 ```
 
 ## Changelog
+
+### Unreleased
+
+- **BREAKING:** removed the `unmatched_behaviour` option. It was declared, defaulted and validated but never read, and `pass_through` was not implementable — the factory registers only `connector.WithLogsToTraces`, so the connector has no logs consumer and cannot emit log records. Users who chose `pass_through` to avoid data loss were getting a silent drop. Unmatched records are dropped by design; split them into a separate pipeline with the `filterprocessor` beforehand (recipe in [Filtering unmatched logs](#filtering-unmatched-logs)). Configs that still set the key now fail to load with `has invalid keys: unmatched_behaviour` — a loud failure instead of a documented no-op.
+- Fixed a stale-timer race that could silently drop records. After a `max_logs_per_trace` split, the retiring group's already-queued timer callback could run late and delete the *replacement* group from the internal map, orphaning its records and breaking the span-link chain. A group is now marked flushed once emitted, a stale callback is a no-op, and a callback only evicts the map entry it still owns. This also removes a duplicate emission from the second of the two timers per group. ([#7](https://github.com/agardnerIT/logs-to-spans-otel/issues/7))
+- Configuration errors are now reported instead of panicking or being silently rewritten ([#9](https://github.com/agardnerIT/logs-to-spans-otel/issues/9), [#16](https://github.com/agardnerIT/logs-to-spans-otel/issues/16)):
+  - `group_by_keys` entries are quoted before being compiled into the extraction pattern, so `user.id` matches `user.id=42` literally and no longer also matches `userXid=42`; keys such as `user(` no longer panic at startup
+  - an empty `group_by_keys` is a startup error rather than silently dropping 100% of input
+- Fixed the documented install path and the shipped example configs; the filelog timestamp layout is `strptime` `%Y-%m-%d %H:%M:%S`, and expected parse misses no longer log an error per line ([#10](https://github.com/agardnerIT/logs-to-spans-otel/issues/10))
+- CI builds the working tree (via an OCB `replaces:` block) and gates on `go vet` and `go test -race`, instead of validating the published tag and skipping tests ([#18](https://github.com/agardnerIT/logs-to-spans-otel/issues/18))
+- Documented the produced-span schema (resource, scope, span kind, attributes, links) and the resource-attribute grouping caveat
 
 ### v0.4.0
 

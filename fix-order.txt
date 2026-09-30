@@ -351,6 +351,54 @@ A credible donation does not need all 13. Ship this set and defer #12, #13,
 will raise on the first pass.
 
 
+DOCUMENTATION - EVERY SESSION, NO EXCEPTIONS
+===========================================
+
+Undocumented behaviour is a bug. Every session must leave the docs true.
+Nothing merges that a user can observe and cannot read about.
+
+If it changed, it gets documented:
+
+  - new or changed config key      -> README "Configuration > Reference" table
+  - removed config key             -> delete the table row, fix the how-to
+                                      section that taught it, and add a
+                                      Changelog entry marked BREAKING
+  - changed observable behaviour   -> the README section that describes it
+    (timing, flushing, what gets
+    dropped, error/validation text,
+    span links, defaults)
+  - anything new visible in the
+    output (attribute, scope name,
+    span kind, resource)           -> README "Produced spans" table
+  - a bug fix a user could have
+    hit                            -> README Changelog
+  - a limitation or caveat you
+    discover                       -> document it where the feature is
+                                      described, and link the issue that
+                                      will fix it
+
+Where it goes:
+  - README.md is the source of truth for users. The "Configuration >
+    Reference" table and the "Produced spans" table are kept in sync with
+    config.go and connector.go by hand.
+  - README.md "Changelog" gets an entry per session. Add to or extend the
+    "### Unreleased" heading; never invent a version number, tags are cut
+    separately (see KNOWN GOTCHAS).
+  - At donation time this all becomes metadata.yaml + .chloggen entries
+    (#17). Do NOT create a .chloggen directory in this repo.
+
+Honest escape hatch - a purely internal refactor with no observable change
+needs no README edit, but you must say "no user-visible change" in the issue
+comment. That makes it a decision, not an omission.
+
+Test it before closing:
+  - walk your own diff and ask, for each hunk, "where is this documented?"
+  - run the example collector end to end and follow the README as if you had
+    never seen the code
+  - the config reference table has one row per field in config.go - check the
+    count
+
+
 PER-SESSION CHECKLIST
 =====================
 
@@ -360,7 +408,9 @@ Each session, one issue:
     - make the change
     - go vet ./...
     - go test -race -count=1 ./...
-    - update the README if any config key changed
+    - update the docs for every user-visible change - config keys, output
+      schema, or fixed bugs all get a README Changelog entry. See
+      DOCUMENTATION - EVERY SESSION above.
     - keep the issue body as the spec; do not widen scope mid-session
     - push the branch and wait for CI to go GREEN before closing the issue.
       A red run means the issue is NOT done - fix it in the same session.
