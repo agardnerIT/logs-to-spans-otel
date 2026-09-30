@@ -100,7 +100,7 @@ func TestExtractGroupKey_Unstructured(t *testing.T) {
 			cfg := createDefaultConfig()
 			cfg.GroupByKeys = keys
 			conn := createTestConnector(t, cfg, sink)
-			
+
 			lr := newLogRecord(tt.body, time.Now(), "INFO")
 			got := conn.(*logsToSpansConnector).extractGroupKey(lr)
 			assert.Equal(t, tt.expected, got)
@@ -588,49 +588,164 @@ func TestCompiledRegexReuseAcrossMultipleCalls(t *testing.T) {
 	}
 }
 
+// TestGroupByKeyMetacharactersMatchLiterally covers the keys that used to
+// panic at factory construction or match the wrong records. Every key below
+// is special to regexp and must be treated as a plain string.
+func TestGroupByKeyMetacharactersMatchLiterally(t *testing.T) {
+	for _, key := range []string{"user.id", "user(", "user+", "user[", "user|", "user*", "user?", "user\\"} {
+		t.Run(key, func(t *testing.T) {
+			sink := newTestSink()
+			cfg := createDefaultConfig()
+			cfg.Timeout = 100 * time.Millisecond
+			cfg.GroupByKeys = []string{key}
+			conn := createTestConnector(t, cfg, sink)
+
+			lr := newLogRecord(key+"=abc hello", time.Now(), "INFO")
+			got := conn.(*logsToSpansConnector).extractGroupKey(lr)
+			assert.Equal(t, "abc", got)
+		})
+	}
+}
+
+func TestGroupByKeyMetacharactersDoNotFalseMatch(t *testing.T) {
+	// '.' is a regex wildcard: without QuoteMeta, "user.id" matches "userXid".
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.GroupByKeys = []string{"user.id"}
+	conn := createTestConnector(t, cfg, sink)
+
+	lr := newLogRecord("userXid=abc hello", time.Now(), "INFO")
+	got := conn.(*logsToSpansConnector).extractGroupKey(lr)
+	assert.Empty(t, got)
+}
+
+func TestConfigValidateAcceptsMetacharacterKeys(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.GroupByKeys = []string{"user.id", "user(", "a+b", "[x]"}
+	require.NoError(t, cfg.Validate())
+}
+
+func TestFactoryReturnsErrorForEmptyGroupByKey(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{""}
+	factory := NewFactory()
+
+	_, err := factory.CreateLogsToTraces(context.Background(), newTestSettings(), cfg, newTestSink())
+	require.Error(t, err, "the factory must return an error, not panic")
+}
+
+// validTestConfig returns a config that passes validation, so individual
+// tests can flip one field and assert on that field alone.
+func validTestConfig() *Config {
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	return cfg
+}
+
+func TestConfigValidateAcceptsValidConfig(t *testing.T) {
+	require.NoError(t, validTestConfig().Validate())
+}
+
 func TestConfigValidateNegativeTimeout(t *testing.T) {
-	cfg := &Config{Timeout: -1 * time.Second}
+	cfg := validTestConfig()
+	cfg.Timeout = -1 * time.Second
 	err := cfg.Validate()
-	require.NoError(t, err)
-	assert.Equal(t, 5*time.Second, cfg.Timeout)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timeout")
+	assert.Equal(t, -1*time.Second, cfg.Timeout, "Validate must not rewrite the value")
+}
+
+func TestConfigValidateZeroTimeout(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Timeout = 0
+	require.Error(t, cfg.Validate())
 }
 
 func TestConfigValidateNegativeMaxWait(t *testing.T) {
-	cfg := &Config{MaxWait: -1 * time.Second}
+	cfg := validTestConfig()
+	cfg.MaxWait = -1 * time.Second
 	err := cfg.Validate()
-	require.NoError(t, err)
-	assert.Equal(t, 30*time.Second, cfg.MaxWait)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_wait")
+	assert.Equal(t, -1*time.Second, cfg.MaxWait, "Validate must not rewrite the value")
 }
 
 func TestConfigValidateNegativeEndSpanDuration(t *testing.T) {
-	cfg := &Config{EndSpanDuration: -1 * time.Second}
+	cfg := validTestConfig()
+	cfg.EndSpanDuration = -1 * time.Second
 	err := cfg.Validate()
-	require.NoError(t, err)
-	assert.Equal(t, 500*time.Millisecond, cfg.EndSpanDuration)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "end_span_duration")
+	assert.Equal(t, -1*time.Second, cfg.EndSpanDuration, "Validate must not rewrite the value")
 }
 
 func TestConfigValidateEmptyUnmatchedBehaviour(t *testing.T) {
-	cfg := &Config{UnmatchedBehaviour: ""}
+	cfg := validTestConfig()
+	cfg.UnmatchedBehaviour = ""
 	err := cfg.Validate()
-	require.NoError(t, err)
-	assert.Equal(t, "drop", cfg.UnmatchedBehaviour)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unmatched_behaviour")
+	assert.Empty(t, cfg.UnmatchedBehaviour, "Validate must not rewrite the value")
+}
+
+func TestConfigValidateUnknownUnmatchedBehaviour(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.UnmatchedBehaviour = "passthrough"
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unmatched_behaviour")
+}
+
+func TestConfigValidateAcceptsPassThrough(t *testing.T) {
+	// pass_through is still part of the documented surface; #8 decides whether
+	// it is removed or implemented.
+	cfg := validTestConfig()
+	cfg.UnmatchedBehaviour = UnmatchedBehaviourPassThrough
+	require.NoError(t, cfg.Validate())
 }
 
 func TestConfigValidateEmptyServiceName(t *testing.T) {
-	cfg := &Config{ServiceName: ""}
+	cfg := validTestConfig()
+	cfg.ServiceName = ""
 	err := cfg.Validate()
-	require.NoError(t, err)
-	assert.Equal(t, "logs-to-spans", cfg.ServiceName)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "service_name")
+	assert.Empty(t, cfg.ServiceName, "Validate must not rewrite the value")
+}
+
+func TestConfigValidateRejectsEmptyGroupByKeys(t *testing.T) {
+	cfg := createDefaultConfig()
+	err := cfg.Validate()
+	require.Error(t, err, "empty group_by_keys silently drops every record and must be rejected")
+	assert.Contains(t, err.Error(), "group_by_keys")
+}
+
+func TestConfigValidateRejectsEmptyGroupByKeyEntry(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.GroupByKeys = []string{"user", ""}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group_by_keys")
+}
+
+func TestConfigValidateDoesNotMutate(t *testing.T) {
+	cfg := &Config{}
+	require.Error(t, cfg.Validate())
+	assert.Zero(t, cfg.Timeout)
+	assert.Zero(t, cfg.MaxWait)
+	assert.Zero(t, cfg.EndSpanDuration)
+	assert.Empty(t, cfg.UnmatchedBehaviour)
+	assert.Empty(t, cfg.ServiceName)
 }
 
 func TestConfigValidateKeepsExplicitValues(t *testing.T) {
-	cfg := &Config{
-		Timeout:            10 * time.Second,
-		MaxWait:            60 * time.Second,
-		EndSpanDuration:    1 * time.Second,
-		UnmatchedBehaviour: "pass_through",
-		ServiceName:        "custom",
-	}
+	cfg := validTestConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 60 * time.Second
+	cfg.EndSpanDuration = 1 * time.Second
+	cfg.UnmatchedBehaviour = "pass_through"
+	cfg.ServiceName = "custom"
 	err := cfg.Validate()
 	require.NoError(t, err)
 	assert.Equal(t, 10*time.Second, cfg.Timeout)
@@ -1169,11 +1284,10 @@ func TestUnstructuredKeyValueWithHyphen(t *testing.T) {
 	assert.Equal(t, "abc-123", val.Str())
 }
 
-func TestServiceNameDefaultWhenEmpty(t *testing.T) {
-	cfg := &Config{ServiceName: ""}
-	err := cfg.Validate()
-	require.NoError(t, err)
-	assert.Equal(t, "logs-to-spans", cfg.ServiceName)
+func TestServiceNameRequiredWhenEmpty(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.ServiceName = ""
+	require.Error(t, cfg.Validate())
 }
 
 func TestConfigDefaultMaxLogsPerTrace(t *testing.T) {
@@ -1182,16 +1296,19 @@ func TestConfigDefaultMaxLogsPerTrace(t *testing.T) {
 }
 
 func TestConfigValidateNegativeMaxLogsPerTrace(t *testing.T) {
-	cfg := &Config{MaxLogsPerTrace: -1}
+	cfg := validTestConfig()
+	cfg.MaxLogsPerTrace = -1
 	err := cfg.Validate()
-	require.NoError(t, err)
-	assert.Equal(t, 100, cfg.MaxLogsPerTrace)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_logs_per_trace")
+	assert.Equal(t, -1, cfg.MaxLogsPerTrace, "Validate must not rewrite the value")
 }
 
 func TestConfigValidateZeroMaxLogsPerTrace(t *testing.T) {
-	cfg := &Config{MaxLogsPerTrace: 0}
+	cfg := validTestConfig()
+	cfg.MaxLogsPerTrace = 0
 	err := cfg.Validate()
-	require.NoError(t, err)
+	require.NoError(t, err, "zero means 'no limit' and is valid")
 	assert.Equal(t, 0, cfg.MaxLogsPerTrace)
 }
 

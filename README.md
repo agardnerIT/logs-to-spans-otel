@@ -55,6 +55,10 @@ The connector tries two strategies in order:
 1. **Structured (Map) body** — if the log body is a JSON object, it looks for top-level keys matching `group_by_keys`
 2. **Unstructured (string) body** — falls back to regex `key=(\S+)` to extract values
 
+`group_by_keys` entries are matched **literally**, not as regular expressions: `user.id` matches `user.id=42` but not `userXid=42`.
+
+`group_by_keys` is required. An empty list would consume every log record and emit nothing, so it is rejected as a configuration error at startup.
+
 Logs that don't match any key are silently dropped (or you can split them into a separate pipeline — see [Filtering unmatched logs](#filtering-unmatched-logs)).
 
 ### Duration extraction
@@ -73,7 +77,7 @@ Logs without a valid duration attribute fall back to the default behaviour: each
 | `timeout` | duration | `5s` | **Inactivity timeout.** Resets every time a new log arrives for a group. When no new logs arrive for this long, the group is flushed and converted to a trace. |
 | `max_wait` | duration | `30s` | **Absolute max wait.** Maximum time from the *first* log in a group before it is force-flushed — regardless of ongoing activity. Prevents groups with continuous log streams from never being emitted. |
 | `max_logs_per_trace` | int | `100` | **Max logs per trace.** Maximum number of log records in a single group/trace. When the limit is reached, the current group is flushed early and a new group starts. Set to `0` for no limit. Traces are connected via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links). |
-| `group_by_keys` | string list | `[]` | Keys to extract from each log body and group by (tried in order). See [Key extraction](#key-extraction). |
+| `group_by_keys` | string list | **(required)** | Keys to extract from each log body and group by (tried in order). Matched literally, not as regexes. Must contain at least one non-empty key. See [Key extraction](#key-extraction). |
 | `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
 | `unmatched_behaviour` | string | `"drop"` | What to do with logs that don't match any `group_by_keys`: `"drop"` (silently discard) or `"pass_through"` (forward unchanged to a separate pipeline). |

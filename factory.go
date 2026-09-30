@@ -2,7 +2,6 @@ package logs_to_spans
 
 import (
 	"context"
-	"regexp"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/connector"
@@ -26,14 +25,15 @@ func createLogsToTraces(
 	tracesConsumer consumer.Traces,
 ) (connector.Logs, error) {
 	c := cfg.(*Config)
-	
-	// Pre-compile regex patterns for group_by_keys
-	compiledRegex := make([]*regexp.Regexp, 0, len(c.GroupByKeys))
-	for _, key := range c.GroupByKeys {
-		re := regexp.MustCompile(key + `=(\S+)`)
-		compiledRegex = append(compiledRegex, re)
+
+	// Config.Validate compiles the same patterns and returns any error, but the
+	// factory can be reached without Validate (direct construction in tests and
+	// embedders), so compile here too rather than panicking.
+	compiledRegex, err := buildGroupKeyRegexes(c.GroupByKeys)
+	if err != nil {
+		return nil, err
 	}
-	
+
 	return &logsToSpansConnector{
 		config:         c,
 		logger:         set.Logger,
