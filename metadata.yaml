@@ -25,6 +25,9 @@ tests:
     max_groups: 1000
     group_by_keys: [userID]
     group_by_resource_attributes: [service.name]
+    duration_keys: [duration]
+    trace_id_keys: [trace_id]
+    span_id_keys: [span_id]
     end_span_duration: 500ms
     copy_resource_attributes: true
     service_name: test-service

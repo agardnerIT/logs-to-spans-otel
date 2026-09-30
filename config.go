@@ -55,6 +55,21 @@ type Config struct {
 	// span duration.
 	DurationKeys []string `mapstructure:"duration_keys"`
 
+	// TraceIDKeys is the ordered list of attribute names that hold an
+	// originating trace ID, as a 32-character hex string or 16 raw bytes. When a
+	// log record carries one, the span generated from it links back to that
+	// trace. Record-level trace context (set by a receiver or trace_parser
+	// operator) takes precedence over these attributes. An empty list disables
+	// the attribute lookup.
+	TraceIDKeys []string `mapstructure:"trace_id_keys"`
+
+	// SpanIDKeys is the ordered list of attribute names that hold the
+	// originating span ID, as a 16-character hex string or 8 raw bytes. It is
+	// looked up independently of TraceIDKeys, so a record-level trace ID can be
+	// paired with a span ID from an attribute. An empty list disables the
+	// attribute lookup.
+	SpanIDKeys []string `mapstructure:"span_id_keys"`
+
 	// EndSpanDuration is the duration given to the last span in a group when
 	// neither an explicit duration nor a following log provides an end time.
 	EndSpanDuration time.Duration `mapstructure:"end_span_duration"`
@@ -127,6 +142,14 @@ func (cfg *Config) Validate() error {
 		errs = append(errs, err)
 	}
 
+	if err := validateAttributeKeys("trace_id_keys", cfg.TraceIDKeys); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := validateAttributeKeys("span_id_keys", cfg.SpanIDKeys); err != nil {
+		errs = append(errs, err)
+	}
+
 	if cfg.Timeout <= 0 {
 		errs = append(errs, fmt.Errorf("timeout must be greater than zero, got %s", cfg.Timeout))
 	}
@@ -155,6 +178,8 @@ func createDefaultConfig() *Config {
 		GroupByAttributes:         []string{},
 		GroupByResourceAttributes: []string{},
 		DurationKeys:              []string{},
+		TraceIDKeys:               []string{"trace_id", "trace.id"},
+		SpanIDKeys:                []string{"span_id", "span.id"},
 		EndSpanDuration:           500 * time.Millisecond,
 		CopyResourceAttributes:    true,
 		// Empty means "preserve the source service.name, fall back to

@@ -22,6 +22,8 @@ all_options:
   group_by_attributes: [user.id]
   group_by_resource_attributes: [service.name, k8s.pod.name]
   duration_keys: [duration]
+  trace_id_keys: [trace_id, trace.id]
+  span_id_keys: [span_id, span.id]
   end_span_duration: 500ms
   copy_resource_attributes: true
   service_name: my-app

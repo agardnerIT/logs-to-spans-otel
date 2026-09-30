@@ -6,6 +6,7 @@ package logs_to_spans
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"regexp"
 	"sort"
 	"strconv"
@@ -63,6 +64,11 @@ type logRecord struct {
 	duration  time.Duration
 	body      string
 	severity  string
+	// traceID and spanID are the trace context the log record arrived with,
+	// zero when it carried none. They become a span link on the generated span
+	// so the emitted trace stays connected to the real trace it came from.
+	traceID pcommon.TraceID
+	spanID  pcommon.SpanID
 }
 
 func (c *logsToSpansConnector) Capabilities() consumer.Capabilities {
@@ -319,12 +325,103 @@ func extractLogRecord(lr plog.LogRecord, cfg *Config) *logRecord {
 		}
 	}
 
+	traceID, spanID := extractTraceContext(lr, cfg)
+
 	return &logRecord{
 		timestamp: ts,
 		duration:  dur,
 		body:      valueToString(lr.Body()),
 		severity:  lr.SeverityText(),
+		traceID:   traceID,
+		spanID:    spanID,
 	}
+}
+
+// extractTraceContext returns the originating trace and span IDs carried by a
+// log record, or zero values when it carries none. Precedence for each ID is
+// the record-level trace context first (a receiver, OTLP-native application or
+// trace_parser operator sets it directly), then the configured trace_id_keys /
+// span_id_keys attributes in order. The two lookups are independent: a
+// record-level trace ID can be paired with a span ID from an attribute.
+func extractTraceContext(lr plog.LogRecord, cfg *Config) (pcommon.TraceID, pcommon.SpanID) {
+	traceID := lr.TraceID()
+	if traceID.IsEmpty() {
+		for _, key := range cfg.TraceIDKeys {
+			if v, ok := lr.Attributes().Get(key); ok {
+				if id, ok := parseTraceIDValue(v); ok {
+					traceID = id
+					break
+				}
+			}
+		}
+	}
+
+	spanID := lr.SpanID()
+	if spanID.IsEmpty() {
+		for _, key := range cfg.SpanIDKeys {
+			if v, ok := lr.Attributes().Get(key); ok {
+				if id, ok := parseSpanIDValue(v); ok {
+					spanID = id
+					break
+				}
+			}
+		}
+	}
+
+	return traceID, spanID
+}
+
+// decodeIDBytes returns the raw bytes of a trace or span ID held in an
+// attribute value, accepting a hex string or raw bytes of exactly size bytes.
+// It rejects anything else, including a wrong length and malformed hex.
+func decodeIDBytes(v pcommon.Value, size int) ([]byte, bool) {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		b, err := hex.DecodeString(strings.TrimSpace(v.Str()))
+		if err != nil || len(b) != size {
+			return nil, false
+		}
+		return b, true
+	case pcommon.ValueTypeBytes:
+		b := v.Bytes().AsRaw()
+		if len(b) != size {
+			return nil, false
+		}
+		return b, true
+	default:
+		return nil, false
+	}
+}
+
+// parseTraceIDValue decodes a 16-byte trace ID from an attribute value. An
+// invalid or all-zero ID is rejected so the record is treated as having no
+// trace context instead of linking to nowhere.
+func parseTraceIDValue(v pcommon.Value) (pcommon.TraceID, bool) {
+	b, ok := decodeIDBytes(v, len(pcommon.TraceID{}))
+	if !ok {
+		return pcommon.TraceID{}, false
+	}
+	var id pcommon.TraceID
+	copy(id[:], b)
+	if id.IsEmpty() {
+		return pcommon.TraceID{}, false
+	}
+	return id, true
+}
+
+// parseSpanIDValue decodes an 8-byte span ID from an attribute value. It has the
+// same acceptance rules as parseTraceIDValue.
+func parseSpanIDValue(v pcommon.Value) (pcommon.SpanID, bool) {
+	b, ok := decodeIDBytes(v, len(pcommon.SpanID{}))
+	if !ok {
+		return pcommon.SpanID{}, false
+	}
+	var id pcommon.SpanID
+	copy(id[:], b)
+	if id.IsEmpty() {
+		return pcommon.SpanID{}, false
+	}
+	return id, true
 }
 
 func parseDuration(v pcommon.Value) time.Duration {
@@ -517,6 +614,17 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 		if i > 0 {
 			parentSpanID := ss.Spans().At(i - 1).SpanID()
 			span.SetParentSpanID(parentSpanID)
+		}
+
+		// Link back to the trace the log record came from, when it carried trace
+		// context. This is independent of the max_logs_per_trace chain link
+		// below: the span is part of the generated trace and also points at its
+		// origin. A record-level or attribute trace ID is enough for the link;
+		// the span ID is zero when the record carried none.
+		if !rec.traceID.IsEmpty() {
+			link := span.Links().AppendEmpty()
+			link.SetTraceID(rec.traceID)
+			link.SetSpanID(rec.spanID)
 		}
 
 		if i == 0 && group.prevTraceID != (pcommon.TraceID{}) {

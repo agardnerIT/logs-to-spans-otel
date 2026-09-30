@@ -39,6 +39,16 @@ properties:
   service_name:
     description: ServiceName overrides the service.name resource attribute of every emitted trace. When empty, the source logs' service.name is preserved and "logs-to-spans" is used when the source has none.
     type: string
+  span_id_keys:
+    description: SpanIDKeys is the ordered list of attribute names that hold the originating span ID, as a 16-character hex string or 8 raw bytes. It is looked up independently of TraceIDKeys, so a record-level trace ID can be paired with a span ID from an attribute. An empty list disables the attribute lookup.
+    type: array
+    items:
+      type: string
   timeout:
     description: Timeout is the inactivity period after which a group is flushed. Each new log record in a group resets it.
     x-customType: time.duration
+  trace_id_keys:
+    description: TraceIDKeys is the ordered list of attribute names that hold an originating trace ID, as a 32-character hex string or 16 raw bytes. When a log record carries one, the span generated from it links back to that trace. Record-level trace context (set by a receiver or trace_parser operator) takes precedence over these attributes. An empty list disables the attribute lookup.
+    type: array
+    items:
+      type: string

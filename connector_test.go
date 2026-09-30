@@ -5,7 +5,9 @@ package logs_to_spans
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2320,4 +2322,293 @@ func TestConfigValidateRejectsEmptyResourceAttributeKey(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "group_by_resource_attributes")
+}
+
+// --- originating trace context (#13) ---
+
+const (
+	testTraceIDHex = "4bf92f3577b34da6a3ce929d0e0e4736"
+	testSpanIDHex  = "00f067aa0ba902b7"
+)
+
+func traceIDFromHex(t *testing.T, s string) pcommon.TraceID {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	require.NoError(t, err)
+	var id pcommon.TraceID
+	copy(id[:], b)
+	return id
+}
+
+func spanIDFromHex(t *testing.T, s string) pcommon.SpanID {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	require.NoError(t, err)
+	var id pcommon.SpanID
+	copy(id[:], b)
+	return id
+}
+
+func TestConfigDefaultsTraceIDKeys(t *testing.T) {
+	cfg := createDefaultConfig()
+	assert.Equal(t, []string{"trace_id", "trace.id"}, cfg.TraceIDKeys)
+	assert.Equal(t, []string{"span_id", "span.id"}, cfg.SpanIDKeys)
+}
+
+func TestExtractTraceContextFromRecord(t *testing.T) {
+	cfg := createDefaultConfig()
+	lr := newLogRecord("user=123 log", time.Now(), "INFO")
+	lr.SetTraceID(traceIDFromHex(t, testTraceIDHex))
+	lr.SetSpanID(spanIDFromHex(t, testSpanIDHex))
+
+	traceID, spanID := extractTraceContext(lr, cfg)
+	assert.Equal(t, traceIDFromHex(t, testTraceIDHex), traceID)
+	assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID)
+}
+
+func TestExtractTraceContextFromAttributes(t *testing.T) {
+	cfg := createDefaultConfig()
+	for _, tc := range []struct {
+		name     string
+		traceKey string
+		spanKey  string
+	}{
+		{name: "snake_case", traceKey: "trace_id", spanKey: "span_id"},
+		{name: "dotted", traceKey: "trace.id", spanKey: "span.id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lr := newLogRecordWithAttrs("user=123 log", time.Now(), "INFO", map[string]string{
+				tc.traceKey: testTraceIDHex,
+				tc.spanKey:  testSpanIDHex,
+			})
+			traceID, spanID := extractTraceContext(lr, cfg)
+			assert.Equal(t, traceIDFromHex(t, testTraceIDHex), traceID)
+			assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID)
+		})
+	}
+}
+
+func TestExtractTraceContextFromBytesAttributes(t *testing.T) {
+	cfg := createDefaultConfig()
+	lr := newLogRecord("user=123 log", time.Now(), "INFO")
+	traceBytes := traceIDFromHex(t, testTraceIDHex)
+	spanBytes := spanIDFromHex(t, testSpanIDHex)
+	lr.Attributes().PutEmptyBytes("trace_id").FromRaw(traceBytes[:])
+	lr.Attributes().PutEmptyBytes("span_id").FromRaw(spanBytes[:])
+
+	traceID, spanID := extractTraceContext(lr, cfg)
+	assert.Equal(t, traceIDFromHex(t, testTraceIDHex), traceID)
+	assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID)
+}
+
+func TestExtractTraceContextRecordWinsOverAttribute(t *testing.T) {
+	cfg := createDefaultConfig()
+	recordTraceID := traceIDFromHex(t, testTraceIDHex)
+	recordSpanID := spanIDFromHex(t, testSpanIDHex)
+	lr := newLogRecordWithAttrs("user=123 log", time.Now(), "INFO", map[string]string{
+		"trace_id": "11111111111111111111111111111111",
+		"span_id":  "2222222222222222",
+	})
+	lr.SetTraceID(recordTraceID)
+	lr.SetSpanID(recordSpanID)
+
+	traceID, spanID := extractTraceContext(lr, cfg)
+	assert.Equal(t, recordTraceID, traceID, "record-level trace context must beat the attribute")
+	assert.Equal(t, recordSpanID, spanID, "record-level span context must beat the attribute")
+}
+
+func TestExtractTraceContextCustomKeys(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.TraceIDKeys = []string{"my.trace"}
+	cfg.SpanIDKeys = []string{"my.span"}
+	lr := newLogRecordWithAttrs("user=123 log", time.Now(), "INFO", map[string]string{
+		"trace_id": "11111111111111111111111111111111",
+		"my.trace": testTraceIDHex,
+		"my.span":  testSpanIDHex,
+	})
+
+	traceID, spanID := extractTraceContext(lr, cfg)
+	assert.Equal(t, traceIDFromHex(t, testTraceIDHex), traceID, "custom key wins and the defaults are not consulted")
+	assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID)
+}
+
+func TestExtractTraceContextIgnoresInvalidAndEmptyIDs(t *testing.T) {
+	cfg := createDefaultConfig()
+	for name, raw := range map[string]string{
+		"not-hex":      "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+		"too-short":    "abc123",
+		"all-zero-hex": strings.Repeat("0", 32),
+		"empty-string": "",
+		"odd-length":   "4bf92f3577b34da6a3ce929d0e0e473",
+	} {
+		t.Run(name, func(t *testing.T) {
+			lr := newLogRecordWithAttrs("user=123 log", time.Now(), "INFO", map[string]string{
+				"trace_id": raw,
+				"span_id":  testSpanIDHex,
+			})
+			traceID, spanID := extractTraceContext(lr, cfg)
+			assert.True(t, traceID.IsEmpty(), "an invalid trace ID must be ignored")
+			assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID,
+				"a bad trace ID must not discard a valid span ID")
+		})
+	}
+}
+
+func TestExtractTraceContextEmptyKeyListsDisableLookup(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.TraceIDKeys = []string{}
+	cfg.SpanIDKeys = []string{}
+	lr := newLogRecordWithAttrs("user=123 log", time.Now(), "INFO", map[string]string{
+		"trace_id": testTraceIDHex,
+		"span_id":  testSpanIDHex,
+	})
+
+	traceID, spanID := extractTraceContext(lr, cfg)
+	assert.True(t, traceID.IsEmpty())
+	assert.True(t, spanID.IsEmpty())
+}
+
+func TestRecordTraceContextProducesSpanLink(t *testing.T) {
+	sink := newTestSink()
+	cfg := validTestConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	conn := createTestConnector(t, cfg, sink)
+
+	originTrace := traceIDFromHex(t, testTraceIDHex)
+	originSpan := spanIDFromHex(t, testSpanIDHex)
+	lr := newLogRecord("user=123 log", time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC), "INFO")
+	lr.SetTraceID(originTrace)
+	lr.SetSpanID(originSpan)
+
+	sendLogs(t, conn, []plog.LogRecord{lr})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	require.Equal(t, 1, span.Links().Len(), "a span from a record with trace context must link to it")
+	assert.Equal(t, originTrace, span.Links().At(0).TraceID())
+	assert.Equal(t, originSpan, span.Links().At(0).SpanID())
+}
+
+func TestAttributeTraceContextProducesSpanLink(t *testing.T) {
+	sink := newTestSink()
+	cfg := validTestConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	conn := createTestConnector(t, cfg, sink)
+
+	lr := newLogRecordWithAttrs("user=123 log", time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC), "INFO",
+		map[string]string{"trace_id": testTraceIDHex, "span_id": testSpanIDHex})
+
+	sendLogs(t, conn, []plog.LogRecord{lr})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	require.Equal(t, 1, span.Links().Len())
+	assert.Equal(t, traceIDFromHex(t, testTraceIDHex), span.Links().At(0).TraceID())
+	assert.Equal(t, spanIDFromHex(t, testSpanIDHex), span.Links().At(0).SpanID())
+}
+
+func TestEachRecordLinksToItsOwnOrigin(t *testing.T) {
+	sink := newTestSink()
+	cfg := validTestConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	originA := traceIDFromHex(t, testTraceIDHex)
+	originB := traceIDFromHex(t, "11111111111111111111111111111111")
+	r1 := newLogRecord("user=123 first", now, "INFO")
+	r1.SetTraceID(originA)
+	r2 := newLogRecord("user=123 second", now.Add(time.Second), "INFO")
+	r2.SetTraceID(originB)
+
+	sendLogs(t, conn, []plog.LogRecord{r1, r2})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+	spans := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	require.Equal(t, 2, spans.Len())
+	require.Equal(t, 1, spans.At(0).Links().Len())
+	require.Equal(t, 1, spans.At(1).Links().Len())
+	assert.Equal(t, originA, spans.At(0).Links().At(0).TraceID())
+	assert.Equal(t, originB, spans.At(1).Links().At(0).TraceID())
+}
+
+func TestNoTraceContextProducesNoLinks(t *testing.T) {
+	sink := newTestSink()
+	cfg := validTestConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	conn := createTestConnector(t, cfg, sink)
+
+	sendLogs(t, conn, []plog.LogRecord{
+		newLogRecord("user=123 log", time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC), "INFO"),
+	})
+	require.NoError(t, conn.Shutdown(context.Background()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+	spans := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+	require.Equal(t, 1, spans.Len())
+	assert.Zero(t, spans.At(0).Links().Len(), "a record with no trace context must not gain a link")
+}
+
+func TestOriginatingAndChainLinksCoexist(t *testing.T) {
+	sink := newTestSink()
+	cfg := validTestConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.MaxLogsPerTrace = 1
+	conn := createTestConnector(t, cfg, sink)
+
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	originA := traceIDFromHex(t, testTraceIDHex)
+	originB := traceIDFromHex(t, "11111111111111111111111111111111")
+	r1 := newLogRecord("user=123 first", now, "INFO")
+	r1.SetTraceID(originA)
+	r2 := newLogRecord("user=123 second", now.Add(time.Second), "INFO")
+	r2.SetTraceID(originB)
+
+	sendLogs(t, conn, []plog.LogRecord{r1, r2})
+	conn.Shutdown(context.Background())
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2)
+	second := traces[1].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	require.Equal(t, 2, second.Links().Len(), "the split span carries both its origin link and the chain link")
+
+	linkTraceIDs := []pcommon.TraceID{second.Links().At(0).TraceID(), second.Links().At(1).TraceID()}
+	assert.Contains(t, linkTraceIDs, originB, "origin link to the second record's trace")
+	assert.Contains(t, linkTraceIDs, traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).TraceID(),
+		"chain link to the previous generated trace")
+}
+
+func TestConfigValidateRejectsEmptyTraceIDKey(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.TraceIDKeys = []string{"trace_id", ""}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "trace_id_keys")
+}
+
+func TestConfigValidateRejectsEmptySpanIDKey(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.SpanIDKeys = []string{"span_id", ""}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "span_id_keys")
+}
+
+func TestConfigValidateAllowsEmptyTraceIDKeyLists(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.TraceIDKeys = []string{}
+	cfg.SpanIDKeys = []string{}
+	require.NoError(t, cfg.Validate(), "empty lists disable the attribute lookup and are valid")
 }

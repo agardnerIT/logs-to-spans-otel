@@ -109,6 +109,21 @@ The connector reads explicit span durations from log attributes by checking each
 
 Logs without a valid duration attribute fall back to the default behaviour: each span's duration is the time delta to the next log, and the last span in a trace uses `end_span_duration`.
 
+### Linking to the originating trace
+
+When a log record already carries trace context, the span generated from it links back to that trace, so a trace derived from a legacy log stays connected to the real trace it came from. This is the point of the connector for migration: modern services are instrumented, older ones log, and the span link joins the two.
+
+The connector looks for the IDs per record, in this order:
+
+1. **Record-level trace context** — the `trace_id` / `span_id` set on the log record itself by the receiver, by a `filelog` `trace_parser` operator, or by an OTLP-native application. This always wins.
+2. **Attributes** — the names in `trace_id_keys` (default `trace_id`, `trace.id`) and `span_id_keys` (default `span_id`, `span.id`), tried in order. This covers a `transform` processor that copies the IDs out of a body, or a JSON log parsed into attributes.
+
+Values may be 32/16-character hex strings or raw bytes. Anything invalid — wrong length, malformed hex, or an all-zero ID — is ignored, and the record is treated as having no trace context. The trace and span lookups are independent: a record-level trace ID can be paired with a span ID from an attribute, and a record that carries only a trace ID still links (to the trace, with an empty span ID).
+
+Every span in the generated trace links to its own record's origin, not just the first span. This is separate from the `max_logs_per_trace` chain link that connects consecutive generated traces, so a span can carry both.
+
+The incoming trace ID is **not** adopted as the generated trace's ID. A group can hold records from several originating traces, so adopting one would misattribute the others; the link records the relationship without merging two real traces into one. Use `group_by_resource_attributes` to keep sources apart.
+
 ### Produced spans
 
 Each flushed group becomes one `ResourceSpans` batch:
@@ -117,14 +132,14 @@ Each flushed group becomes one `ResourceSpans` batch:
 |---------|-------|
 | Resource attributes | The source `ResourceLogs` resource attributes, copied when `copy_resource_attributes` is `true` (the default). When a group holds records from more than one resource, the **first** record's resource is used. `service.name` precedence: an explicit `service_name` wins; otherwise the source `service.name` is preserved; otherwise `logs-to-spans`. See [Scoping groups by resource](#scoping-groups-by-resource). |
 | Scope name | `logs-to-spans` |
-| Trace ID | random, generated when the group is flushed. A group split by `max_logs_per_trace` gets its own trace ID and is linked back to the previous one. |
+| Trace ID | random, generated when the group is flushed; an incoming trace ID is never adopted, the relationship is recorded as a span link (see [Linking to the originating trace](#linking-to-the-originating-trace)). A group split by `max_logs_per_trace` gets its own trace ID and is linked back to the previous one. |
 | Span name | the full log body. High cardinality by nature — configurable naming is tracked in [#3](https://github.com/agardnerIT/logs-to-spans-otel/issues/3). |
 | Span kind | `Internal` |
 | Span start | the log's `Timestamp`, falling back to `ObservedTimestamp` when `Timestamp` is unset |
 | Span end | `start + duration`, where duration is `duration_keys` → time delta to the next log → `end_span_duration` for the last span |
 | Span attributes | `log.body` (always), `log.severity` (only when non-empty), `group.key` |
 | Parent | the preceding span in the same trace; the first span has no parent |
-| Links | the first span of a follow-on group links to the last span of the previous group's trace, so a group split by `max_logs_per_trace` stays connected |
+| Links | the span for each log record links to the originating trace/span when the record carried trace context — see [Linking to the originating trace](#linking-to-the-originating-trace). In addition, the first span of a follow-on group links to the last span of the previous group's trace, so a group split by `max_logs_per_trace` stays connected. A span can carry both kinds of link. |
 
 Spans are sorted by start timestamp before emission, regardless of the order the logs arrived in.
 
@@ -178,6 +193,8 @@ service:
 | `group_by_attributes` | string list | `[]` | Log attribute names to group by (tried in order). Checked **before** `group_by_keys`; attribute values are stringified. Matched literally, not as regexes. See [Key extraction](#key-extraction). |
 | `group_by_resource_attributes` | string list | `[]` | Resource attribute names that scope a group, so the same key from different sources forms separate traces. Missing attributes contribute an empty value. See [Scoping groups by resource](#scoping-groups-by-resource). |
 | `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
+| `trace_id_keys` | string list | `["trace_id", "trace.id"]` | Log attribute names that hold an originating trace ID, tried in order. Accepts a 32-character hex string or 16 raw bytes. Record-level trace context wins over these attributes. An empty list disables the attribute lookup. See [Linking to the originating trace](#linking-to-the-originating-trace). |
+| `span_id_keys` | string list | `["span_id", "span.id"]` | Log attribute names that hold the originating span ID, tried in order. Accepts a 16-character hex string or 8 raw bytes. Looked up independently of `trace_id_keys`. An empty list disables the attribute lookup. See [Linking to the originating trace](#linking-to-the-originating-trace). |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
 
 > **`timeout` vs `max_wait`:** `timeout` is a *sliding* inactivity window — it resets every time a new log arrives. `max_wait` is a *fixed* deadline from the moment the group is created. A group is flushed when *either* timer fires first.
@@ -218,6 +235,12 @@ connectors:
       - duration
       - time
       - time-spent
+    trace_id_keys:
+      - trace_id
+      - trace.id
+    span_id_keys:
+      - span_id
+      - span.id
     end_span_duration: 500ms
     copy_resource_attributes: true
 ```
@@ -380,6 +403,7 @@ The test suite covers:
 - Flush-on-shutdown
 - Service name propagation
 - `max_logs_per_trace` limit, span links, and chain behaviour
+- Originating trace context from the record and from attributes, span-link emission, and invalid or all-zero ID handling
 - Stale-timer safety after a `max_logs_per_trace` split, and flush idempotency
 - Source resource attribute copying, `group_by_resource_attributes` scoping, and `service.name` precedence across multiple resources
 - Unmatched records being dropped without creating a trace
@@ -430,6 +454,11 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Spans now link back to the originating trace when a log record carries trace context ([#13](https://github.com/agardnerIT/logs-to-spans-otel/issues/13)):
+  - Record-level `trace_id` / `span_id` set by the receiver, a `filelog` `trace_parser` operator, or an OTLP-native application is used directly and wins over attributes.
+  - New `trace_id_keys` (default `["trace_id", "trace.id"]`) and `span_id_keys` (default `["span_id", "span.id"]`) read the IDs from log attributes, as 32/16-character hex strings or raw bytes. Empty lists disable the attribute lookup.
+  - Every span in the generated trace links to its own record's origin, not just the first span. This is independent of the `max_logs_per_trace` chain link, so a span can carry both. Invalid, wrong-length and all-zero IDs are ignored.
+  - The incoming trace ID is not adopted as the generated trace's ID: a group can hold records from several originating traces, so the link records the relationship without merging them.
 - Source resource attributes are now preserved and can scope grouping ([#12](https://github.com/agardnerIT/logs-to-spans-otel/issues/12)):
   - New `copy_resource_attributes` (default `true`) copies the source logs' resource attributes (`host.name`, `k8s.pod.name`, `service.instance.id`, ...) onto the resource of every emitted trace. Previously only `service.name` was written and all other resource context was discarded. When a group holds records from more than one resource, the first record's resource wins — the previously silent collapsing is now documented.
   - New `group_by_resource_attributes` (default empty) scopes a group by resource attribute values, so the same extracted key from different pods or services no longer merges into one trace. It is an additional dimension: `group_by_keys` / `group_by_attributes` must still match. `group.key` remains the extracted value.
