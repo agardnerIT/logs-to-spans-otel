@@ -24,6 +24,7 @@ type logsToSpansConnector struct {
 	mu             sync.Mutex
 	stopped        bool
 	compiledRegex  []*regexp.Regexp
+	telemetry      *telemetry
 }
 
 type logGroup struct {
@@ -57,15 +58,17 @@ func (c *logsToSpansConnector) Start(_ context.Context, _ component.Host) error 
 	return nil
 }
 
-func (c *logsToSpansConnector) ConsumeLogs(_ context.Context, ld plog.Logs) error {
+func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
 	for i := 0; i < ld.ResourceLogs().Len(); i++ {
 		rl := ld.ResourceLogs().At(i)
 		for j := 0; j < rl.ScopeLogs().Len(); j++ {
 			sl := rl.ScopeLogs().At(j)
 			for k := 0; k < sl.LogRecords().Len(); k++ {
 				lr := sl.LogRecords().At(k)
+				c.telemetry.logsIngested.Add(ctx, 1)
 				key := c.extractGroupKey(lr)
 				if key == "" {
+					c.telemetry.unmatchedDropped.Add(ctx, 1)
 					continue
 				}
 				c.addToGroup(key, lr)
@@ -353,6 +356,8 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 		zap.String("group_key", group.key),
 		zap.Int("log_count", len(group.records)),
 	)
+
+	c.telemetry.tracesCreated.Add(ctx, 1)
 
 	if err := c.tracesConsumer.ConsumeTraces(ctx, td); err != nil {
 		c.logger.Error("failed to consume traces", zap.Error(err))

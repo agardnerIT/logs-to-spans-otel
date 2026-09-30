@@ -90,6 +90,30 @@ Spans are sorted by start timestamp before emission, regardless of the order the
 
 > **The connector does not mutate its input.** It declares `Capabilities{MutatesData: false}` and copies everything it needs out of each log record before the upstream batch is released.
 
+### Produced metrics
+
+The connector reports its own internal counters through the collector's `MeterProvider`, so they are emitted on the collector's self-telemetry (the `service::telemetry::metrics` endpoint, `localhost:8888/metrics` by default) and never mixed into the spans being produced. They are for operators: use them to see whether the connector is dropping input or emitting traces at the rate you expect.
+
+| Metric | Type | Incremented when |
+|--------|------|------------------|
+| `otelcol_connector_logs_to_spans_logs_ingested` | counter | every log record the connector consumes |
+| `otelcol_connector_logs_to_spans_traces_created` | counter | every group is flushed and a trace is emitted |
+| `otelcol_connector_logs_to_spans_unmatched_dropped` | counter | a log record matches no `group_by_keys` entry and is dropped |
+
+`logs_ingested` is the total seen, so `logs_ingested - unmatched_dropped` is the number of records that were grouped, and `traces_created` counts the resulting traces. A rising `unmatched_dropped` means the configured keys do not match the input — see [Key extraction](#key-extraction) and the caveat in [Filtering unmatched logs](#filtering-unmatched-logs).
+
+```yaml
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: localhost
+                port: 8888
+```
+
 ## Configuration
 
 ### Reference
@@ -301,6 +325,7 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 ├── config.go            # Config struct and defaults
 ├── factory.go           # OTEL connector factory
 ├── connector.go         # Core implementation
+├── telemetry.go         # Internal metrics instruments
 └── connector_test.go    # Reusable test harness
 ```
 
@@ -308,6 +333,7 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Added internal metrics so operators can observe the connector on the collector's own telemetry endpoint: `otelcol_connector_logs_to_spans_logs_ingested`, `otelcol_connector_logs_to_spans_traces_created`, and `otelcol_connector_logs_to_spans_unmatched_dropped`. Unmatched records have always been dropped silently; the counter makes that visible. New [Produced metrics](#produced-metrics) table. ([#1](https://github.com/agardnerIT/logs-to-spans-otel/issues/1))
 - **BREAKING:** removed the `unmatched_behaviour` option. It was declared, defaulted and validated but never read, and `pass_through` was not implementable — the factory registers only `connector.WithLogsToTraces`, so the connector has no logs consumer and cannot emit log records. Users who chose `pass_through` to avoid data loss were getting a silent drop. Unmatched records are dropped by design; split them into a separate pipeline with the `filterprocessor` beforehand (recipe in [Filtering unmatched logs](#filtering-unmatched-logs)). Configs that still set the key now fail to load with `has invalid keys: unmatched_behaviour` — a loud failure instead of a documented no-op.
 - Fixed a stale-timer race that could silently drop records. After a `max_logs_per_trace` split, the retiring group's already-queued timer callback could run late and delete the *replacement* group from the internal map, orphaning its records and breaking the span-link chain. A group is now marked flushed once emitted, a stale callback is a no-op, and a callback only evicts the map entry it still owns. This also removes a duplicate emission from the second of the two timers per group. ([#7](https://github.com/agardnerIT/logs-to-spans-otel/issues/7))
 - Configuration errors are now reported instead of panicking or being silently rewritten ([#9](https://github.com/agardnerIT/logs-to-spans-otel/issues/9), [#16](https://github.com/agardnerIT/logs-to-spans-otel/issues/16)):
