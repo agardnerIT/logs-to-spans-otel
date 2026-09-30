@@ -25,6 +25,12 @@ jobs:
       - name: Install OpenTelemetry Collector Builder (ocb)
         run: go install go.opentelemetry.io/collector/cmd/builder@v0.154.0
 
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -race -count=1 ./...
+
       - name: Build the collector from builder-config.yaml
         run: $(go env GOPATH)/bin/builder --config builder-config.yaml
 
