@@ -7,26 +7,14 @@ import (
 	"time"
 )
 
-const (
-	// UnmatchedBehaviourDrop silently discards log records that do not match
-	// any group_by_keys entry.
-	UnmatchedBehaviourDrop = "drop"
-	// UnmatchedBehaviourPassThrough is kept for compatibility with the
-	// documented config surface. It is currently a no-op; whether it is
-	// removed or implemented is decided in
-	// https://github.com/agardnerIT/logs-to-spans-otel/issues/8.
-	UnmatchedBehaviourPassThrough = "pass_through"
-)
-
 type Config struct {
-	Timeout            time.Duration `mapstructure:"timeout"`
-	MaxWait            time.Duration `mapstructure:"max_wait"`
-	MaxLogsPerTrace    int           `mapstructure:"max_logs_per_trace"`
-	GroupByKeys        []string      `mapstructure:"group_by_keys"`
-	DurationKeys       []string      `mapstructure:"duration_keys"`
-	EndSpanDuration    time.Duration `mapstructure:"end_span_duration"`
-	UnmatchedBehaviour string        `mapstructure:"unmatched_behaviour"`
-	ServiceName        string        `mapstructure:"service_name"`
+	Timeout         time.Duration `mapstructure:"timeout"`
+	MaxWait         time.Duration `mapstructure:"max_wait"`
+	MaxLogsPerTrace int           `mapstructure:"max_logs_per_trace"`
+	GroupByKeys     []string      `mapstructure:"group_by_keys"`
+	DurationKeys    []string      `mapstructure:"duration_keys"`
+	EndSpanDuration time.Duration `mapstructure:"end_span_duration"`
+	ServiceName     string        `mapstructure:"service_name"`
 }
 
 // groupKeyValuePattern builds the regular expression used to pull "key=value"
@@ -77,13 +65,6 @@ func (cfg *Config) Validate() error {
 	if cfg.EndSpanDuration <= 0 {
 		errs = append(errs, fmt.Errorf("end_span_duration must be greater than zero, got %s", cfg.EndSpanDuration))
 	}
-	switch cfg.UnmatchedBehaviour {
-	case UnmatchedBehaviourDrop, UnmatchedBehaviourPassThrough:
-	default:
-		errs = append(errs, fmt.Errorf(
-			"unmatched_behaviour must be one of [%q, %q], got %q",
-			UnmatchedBehaviourDrop, UnmatchedBehaviourPassThrough, cfg.UnmatchedBehaviour))
-	}
 	if cfg.ServiceName == "" {
 		errs = append(errs, errors.New("service_name must not be empty"))
 	}
@@ -93,13 +74,12 @@ func (cfg *Config) Validate() error {
 
 func createDefaultConfig() *Config {
 	return &Config{
-		Timeout:            5 * time.Second,
-		MaxWait:            30 * time.Second,
-		MaxLogsPerTrace:    100,
-		GroupByKeys:        []string{},
-		DurationKeys:       []string{},
-		EndSpanDuration:    500 * time.Millisecond,
-		UnmatchedBehaviour: UnmatchedBehaviourDrop,
-		ServiceName:        "logs-to-spans",
+		Timeout:         5 * time.Second,
+		MaxWait:         30 * time.Second,
+		MaxLogsPerTrace: 100,
+		GroupByKeys:     []string{},
+		DurationKeys:    []string{},
+		EndSpanDuration: 500 * time.Millisecond,
+		ServiceName:     "logs-to-spans",
 	}
 }

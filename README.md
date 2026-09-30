@@ -80,7 +80,6 @@ Logs without a valid duration attribute fall back to the default behaviour: each
 | `group_by_keys` | string list | **(required)** | Keys to extract from each log body and group by (tried in order). Matched literally, not as regexes. Must contain at least one non-empty key. See [Key extraction](#key-extraction). |
 | `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
-| `unmatched_behaviour` | string | `"drop"` | What to do with logs that don't match any `group_by_keys`: `"drop"` (silently discard) or `"pass_through"` (forward unchanged to a separate pipeline). |
 
 > **`timeout` vs `max_wait`:** `timeout` is a *sliding* inactivity window — it resets every time a new log arrives. `max_wait` is a *fixed* deadline from the moment the group is created. A group is flushed when *either* timer fires first.
 
@@ -102,7 +101,6 @@ connectors:
       - time
       - time-spent
     end_span_duration: 500ms
-    unmatched_behaviour: drop
 ```
 
 ### Pipeline wiring
@@ -120,7 +118,9 @@ service:
 
 ### Filtering unmatched logs
 
-If you want unmatched logs to go to a separate pipeline instead of being dropped, use the `filterprocessor` with `include`/`exclude`:
+Log records that match no `group_by_keys` entry are always dropped — the connector cannot emit log records, so it has no way to forward them. There is no `unmatched_behaviour` option.
+
+If you need to keep unmatched logs, split the stream into two pipelines with the `filterprocessor` before the connector:
 
 ```yaml
 processors:

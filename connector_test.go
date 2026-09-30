@@ -76,7 +76,6 @@ func TestConfigDefaults(t *testing.T) {
 	cfg := createDefaultConfig()
 	assert.Equal(t, 5*time.Second, cfg.Timeout)
 	assert.Equal(t, 500*time.Millisecond, cfg.EndSpanDuration)
-	assert.Equal(t, "drop", cfg.UnmatchedBehaviour)
 	assert.Equal(t, "logs-to-spans", cfg.ServiceName)
 	assert.Equal(t, 30*time.Second, cfg.MaxWait)
 	assert.Empty(t, cfg.GroupByKeys)
@@ -682,29 +681,29 @@ func TestConfigValidateNegativeEndSpanDuration(t *testing.T) {
 	assert.Equal(t, -1*time.Second, cfg.EndSpanDuration, "Validate must not rewrite the value")
 }
 
-func TestConfigValidateEmptyUnmatchedBehaviour(t *testing.T) {
-	cfg := validTestConfig()
-	cfg.UnmatchedBehaviour = ""
-	err := cfg.Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unmatched_behaviour")
-	assert.Empty(t, cfg.UnmatchedBehaviour, "Validate must not rewrite the value")
-}
+// Records that match no group key are always dropped. #8 removed the
+// unmatched_behaviour option: pass_through was never implemented (the
+// connector registers no logs consumer, so it cannot emit log records). Split
+// logs into matched/unmatched pipelines with the filterprocessor before the
+// connector if unmatched records must be kept.
+func TestUnmatchedRecordsAreDropped(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
 
-func TestConfigValidateUnknownUnmatchedBehaviour(t *testing.T) {
-	cfg := validTestConfig()
-	cfg.UnmatchedBehaviour = "passthrough"
-	err := cfg.Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unmatched_behaviour")
-}
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	matched := newLogRecord("user=123 matched", now, "INFO")
+	unmatched := newLogRecord("INFO nothing to group on", now, "INFO")
 
-func TestConfigValidateAcceptsPassThrough(t *testing.T) {
-	// pass_through is still part of the documented surface; #8 decides whether
-	// it is removed or implemented.
-	cfg := validTestConfig()
-	cfg.UnmatchedBehaviour = UnmatchedBehaviourPassThrough
-	require.NoError(t, cfg.Validate())
+	sendLogs(t, conn, []plog.LogRecord{matched, unmatched})
+
+	time.Sleep(300 * time.Millisecond)
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1, "unmatched records must not create a second trace")
+	assert.Equal(t, 1, traces[0].SpanCount(), "only the matched record becomes a span")
 }
 
 func TestConfigValidateEmptyServiceName(t *testing.T) {
@@ -737,7 +736,6 @@ func TestConfigValidateDoesNotMutate(t *testing.T) {
 	assert.Zero(t, cfg.Timeout)
 	assert.Zero(t, cfg.MaxWait)
 	assert.Zero(t, cfg.EndSpanDuration)
-	assert.Empty(t, cfg.UnmatchedBehaviour)
 	assert.Empty(t, cfg.ServiceName)
 }
 
@@ -746,14 +744,12 @@ func TestConfigValidateKeepsExplicitValues(t *testing.T) {
 	cfg.Timeout = 10 * time.Second
 	cfg.MaxWait = 60 * time.Second
 	cfg.EndSpanDuration = 1 * time.Second
-	cfg.UnmatchedBehaviour = "pass_through"
 	cfg.ServiceName = "custom"
 	err := cfg.Validate()
 	require.NoError(t, err)
 	assert.Equal(t, 10*time.Second, cfg.Timeout)
 	assert.Equal(t, 60*time.Second, cfg.MaxWait)
 	assert.Equal(t, 1*time.Second, cfg.EndSpanDuration)
-	assert.Equal(t, "pass_through", cfg.UnmatchedBehaviour)
 	assert.Equal(t, "custom", cfg.ServiceName)
 }
 

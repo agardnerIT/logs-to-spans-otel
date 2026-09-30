@@ -23,7 +23,6 @@ connectors:
       - user_id
       - sess_id
     end_span_duration: 500ms
-    unmatched_behaviour: drop
 
 exporters:
   debug:
