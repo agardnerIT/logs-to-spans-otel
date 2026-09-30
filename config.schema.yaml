@@ -44,6 +44,9 @@ properties:
     type: array
     items:
       type: string
+  span_name_template:
+    description: 'SpanNameTemplate controls the name of every generated span. It is literal text with three placeholders: {body} (the full log body, the default), {severity} (the log record''s severity text) and {truncated:N:body} (the first N characters of the body). An unknown placeholder is a startup error. A template that renders to an empty string falls back to the full body, so a span name is never empty.'
+    type: string
   timeout:
     description: Timeout is the inactivity period after which a group is flushed. Each new log record in a group resets it.
     x-customType: time.duration

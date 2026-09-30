@@ -27,6 +27,7 @@ all_options:
   end_span_duration: 500ms
   copy_resource_attributes: true
   service_name: my-app
+  span_name_template: "{severity}: {truncated:200:body}"
 
 # Scope groups per source so the same key from different pods/services does not
 # merge into one trace, and preserve the source resource attributes.

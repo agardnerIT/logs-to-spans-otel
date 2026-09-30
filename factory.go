@@ -39,12 +39,25 @@ func createLogsToTraces(
 		return nil, err
 	}
 
+	// As with the regexes above, Validate compiles the template and reports a
+	// useful error, but the factory can be reached without Validate. An absent
+	// template means the default body-as-name behaviour.
+	tmpl := c.SpanNameTemplate
+	if tmpl == "" {
+		tmpl = defaultSpanNameTemplate
+	}
+	spanName, err := compileSpanNameTemplate(tmpl)
+	if err != nil {
+		return nil, err
+	}
+
 	conn := &logsToSpansConnector{
 		config:         c,
 		logger:         set.Logger,
 		tracesConsumer: tracesConsumer,
 		groups:         make(map[string]*logGroup),
 		compiledRegex:  compiledRegex,
+		spanName:       spanName,
 	}
 
 	telemetry, err := newTelemetry(set.TelemetrySettings, conn.activeGroupCount)

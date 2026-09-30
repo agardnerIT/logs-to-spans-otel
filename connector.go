@@ -32,6 +32,7 @@ type logsToSpansConnector struct {
 	mu             sync.Mutex
 	stopped        bool
 	compiledRegex  []*regexp.Regexp
+	spanName       *spanNameTemplate
 	telemetry      *metadata.TelemetryBuilder
 }
 
@@ -590,7 +591,7 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 			span.SetSpanID(generateSpanID())
 		}
 
-		span.SetName(rec.body)
+		span.SetName(c.renderSpanName(rec))
 		span.SetStartTimestamp(pcommon.NewTimestampFromTime(rec.timestamp))
 		span.SetKind(ptrace.SpanKindInternal)
 
@@ -644,6 +645,19 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 	if err := c.tracesConsumer.ConsumeTraces(ctx, td); err != nil {
 		c.logger.Error("failed to consume traces", zap.Error(err))
 	}
+}
+
+// renderSpanName expands the configured span_name_template for one record. A
+// template that renders to an empty string (for example {severity} on a record
+// with no severity text) falls back to the full log body, because
+// OpenTelemetry requires a span name and the body is always the most
+// informative thing the connector has.
+func (c *logsToSpansConnector) renderSpanName(rec *logRecord) string {
+	name := c.spanName.render(rec)
+	if name == "" {
+		return rec.body
+	}
+	return name
 }
 
 func generateTraceID() pcommon.TraceID {

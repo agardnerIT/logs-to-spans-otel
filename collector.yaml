@@ -23,6 +23,7 @@ connectors:
       - user_id
       - sess_id
     end_span_duration: 500ms
+    span_name_template: "{truncated:120:body}"
 
 exporters:
   debug:

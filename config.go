@@ -84,6 +84,14 @@ type Config struct {
 	// trace. When empty, the source logs' service.name is preserved and
 	// "logs-to-spans" is used when the source has none.
 	ServiceName string `mapstructure:"service_name"`
+
+	// SpanNameTemplate controls the name of every generated span. It is literal
+	// text with three placeholders: {body} (the full log body, the default),
+	// {severity} (the log record's severity text) and {truncated:N:body} (the
+	// first N characters of the body). An unknown placeholder is a startup
+	// error. A template that renders to an empty string falls back to the full
+	// body, so a span name is never empty.
+	SpanNameTemplate string `mapstructure:"span_name_template"`
 }
 
 // validateAttributeKeys rejects empty entries in an attribute-name list. An
@@ -165,6 +173,11 @@ func (cfg *Config) Validate() error {
 	if cfg.EndSpanDuration <= 0 {
 		errs = append(errs, fmt.Errorf("end_span_duration must be greater than zero, got %s", cfg.EndSpanDuration))
 	}
+
+	if _, err := compileSpanNameTemplate(cfg.SpanNameTemplate); err != nil {
+		errs = append(errs, err)
+	}
+
 	return errors.Join(errs...)
 }
 
@@ -184,6 +197,7 @@ func createDefaultConfig() *Config {
 		CopyResourceAttributes:    true,
 		// Empty means "preserve the source service.name, fall back to
 		// defaultServiceName". A non-empty value is an explicit override.
-		ServiceName: "",
+		ServiceName:      "",
+		SpanNameTemplate: defaultSpanNameTemplate,
 	}
 }

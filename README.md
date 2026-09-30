@@ -124,6 +124,31 @@ Every span in the generated trace links to its own record's origin, not just the
 
 The incoming trace ID is **not** adopted as the generated trace's ID. A group can hold records from several originating traces, so adopting one would misattribute the others; the link records the relationship without merging two real traces into one. Use `group_by_resource_attributes` to keep sources apart.
 
+### Span naming
+
+`span_name_template` sets the name of every generated span. It is literal text with three placeholders:
+
+| Placeholder | Expands to |
+|-------------|------------|
+| `{body}` | the full log body — the default |
+| `{severity}` | the log record's severity text (`ERROR`, `INFO`, ...), empty when the record carries none |
+| `{truncated:N:body}` | the first `N` characters of the body, counted in characters rather than bytes so a multi-byte character is never split |
+
+Anything else is copied through literally, so `{severity}: {body}` produces `ERROR: user=123 connection reset`, and `{severity}: {truncated:120:body}` keeps the severity prefix while capping the name length. Capping is the usual reason to set this option: a span name is an indexed, potentially high-cardinality field, and the raw body can be many kilobytes.
+
+```yaml
+connectors:
+  logs_to_spans:
+    group_by_keys: [userID]
+    span_name_template: "{severity}: {truncated:120:body}"
+```
+
+- The default is `{body}` — the full log body — for backward compatibility.
+- An unknown or malformed placeholder (`{message}`, `{truncated:ten:body}`, an unterminated `{`) is a startup error rather than a silent literal.
+- `{severity}` is empty for logs that do not set one, which would leave a dangling separator (`": body"`). When the whole template renders empty (for example `{severity}` alone on a record with no severity), the name falls back to the full body, because OpenTelemetry requires a non-empty span name. Set the severity upstream — the `filelog` receiver or a `transform` processor — if your logs keep it inside the body.
+- The full body always remains available in the `log.body` span attribute, whatever the template renders.
+- This is deliberately a small template rather than an OTTL expression: OTTL would pull the transform machinery into the connector for the few fields a span name can reasonably use, and the transform processor can already rewrite the body before the connector reads it.
+
 ### Produced spans
 
 Each flushed group becomes one `ResourceSpans` batch:
@@ -133,7 +158,7 @@ Each flushed group becomes one `ResourceSpans` batch:
 | Resource attributes | The source `ResourceLogs` resource attributes, copied when `copy_resource_attributes` is `true` (the default). When a group holds records from more than one resource, the **first** record's resource is used. `service.name` precedence: an explicit `service_name` wins; otherwise the source `service.name` is preserved; otherwise `logs-to-spans`. See [Scoping groups by resource](#scoping-groups-by-resource). |
 | Scope name | `logs-to-spans` |
 | Trace ID | random, generated when the group is flushed; an incoming trace ID is never adopted, the relationship is recorded as a span link (see [Linking to the originating trace](#linking-to-the-originating-trace)). A group split by `max_logs_per_trace` gets its own trace ID and is linked back to the previous one. |
-| Span name | the full log body. High cardinality by nature — configurable naming is tracked in [#3](https://github.com/agardnerIT/logs-to-spans-otel/issues/3). |
+| Span name | rendered from [`span_name_template`](#span-naming) — the default `{body}` is the full log body. |
 | Span kind | `Internal` |
 | Span start | the log's `Timestamp`, falling back to `ObservedTimestamp` when `Timestamp` is unset |
 | Span end | `start + duration`, where duration is `duration_keys` → time delta to the next log → `end_span_duration` for the last span |
@@ -196,6 +221,7 @@ service:
 | `trace_id_keys` | string list | `["trace_id", "trace.id"]` | Log attribute names that hold an originating trace ID, tried in order. Accepts a 32-character hex string or 16 raw bytes. Record-level trace context wins over these attributes. An empty list disables the attribute lookup. See [Linking to the originating trace](#linking-to-the-originating-trace). |
 | `span_id_keys` | string list | `["span_id", "span.id"]` | Log attribute names that hold the originating span ID, tried in order. Accepts a 16-character hex string or 8 raw bytes. Looked up independently of `trace_id_keys`. An empty list disables the attribute lookup. See [Linking to the originating trace](#linking-to-the-originating-trace). |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
+| `span_name_template` | string | `"{body}"` | Template for the span name. Placeholders: `{body}` (full log body), `{severity}` (severity text), `{truncated:N:body}` (first N characters of the body). Unknown or malformed placeholders are a startup error; an empty render falls back to the body. See [Span naming](#span-naming). |
 
 > **`timeout` vs `max_wait`:** `timeout` is a *sliding* inactivity window — it resets every time a new log arrives. `max_wait` is a *fixed* deadline from the moment the group is created. A group is flushed when *either* timer fires first.
 
@@ -243,6 +269,7 @@ connectors:
       - span.id
     end_span_duration: 500ms
     copy_resource_attributes: true
+    span_name_template: "{severity}: {truncated:200:body}"
 ```
 
 ### Pipeline wiring
@@ -454,6 +481,7 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Added `span_name_template` (default `"{body}"`) to control the name of generated spans ([#3](https://github.com/agardnerIT/logs-to-spans-otel/issues/3)). The name was previously always the full log body, which is high-cardinality and can be multi-KB. Placeholders: `{body}` (full log body), `{severity}` (the record's severity text) and `{truncated:N:body}` (the first N characters of the body, counted in characters rather than bytes). An unknown or malformed placeholder is a startup error; a template that renders empty (for example `{severity}` on a record with no severity) falls back to the body so the span name is never empty. The full body remains available as the `log.body` span attribute.
 - Spans now link back to the originating trace when a log record carries trace context ([#13](https://github.com/agardnerIT/logs-to-spans-otel/issues/13)):
   - Record-level `trace_id` / `span_id` set by the receiver, a `filelog` `trace_parser` operator, or an OTLP-native application is used directly and wins over attributes.
   - New `trace_id_keys` (default `["trace_id", "trace.id"]`) and `span_id_keys` (default `["span_id", "span.id"]`) read the IDs from log attributes, as 32/16-character hex strings or raw bytes. Empty lists disable the attribute lookup.

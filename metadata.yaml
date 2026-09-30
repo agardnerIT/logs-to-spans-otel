@@ -31,6 +31,7 @@ tests:
     end_span_duration: 500ms
     copy_resource_attributes: true
     service_name: test-service
+    span_name_template: "{body}"
 
 telemetry:
   metrics:
