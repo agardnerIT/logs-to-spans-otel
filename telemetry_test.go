@@ -4,7 +4,6 @@
 package logs_to_spans
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -26,7 +25,7 @@ func newMetricsTestSettings(t *testing.T) (connector.Settings, *metric.ManualRea
 	t.Helper()
 	reader := metric.NewManualReader()
 	mp := metric.NewMeterProvider(metric.WithReader(reader))
-	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	t.Cleanup(func() { _ = mp.Shutdown(t.Context()) })
 
 	telemetrySettings := componenttest.NewNopTelemetrySettings()
 	telemetrySettings.MeterProvider = mp
@@ -44,7 +43,7 @@ func createMetricsTestConnector(
 ) (connector.Logs, *metric.ManualReader) {
 	t.Helper()
 	settings, reader := newMetricsTestSettings(t)
-	conn, err := NewFactory().CreateLogsToTraces(context.Background(), settings, cfg, sink)
+	conn, err := NewFactory().CreateLogsToTraces(t.Context(), settings, cfg, sink)
 	require.NoError(t, err)
 	return conn, reader
 }
@@ -53,7 +52,7 @@ func createMetricsTestConnector(
 func collectInt64Counters(t *testing.T, reader *metric.ManualReader) map[string]int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(context.Background(), &rm))
+	require.NoError(t, reader.Collect(t.Context(), &rm))
 
 	counters := make(map[string]int64)
 	for _, sm := range rm.ScopeMetrics {
@@ -82,7 +81,7 @@ func metricsTestConfig() *Config {
 func collectInt64Gauges(t *testing.T, reader *metric.ManualReader) map[string]int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(context.Background(), &rm))
+	require.NoError(t, reader.Collect(t.Context(), &rm))
 
 	gauges := make(map[string]int64)
 	for _, sm := range rm.ScopeMetrics {
@@ -210,7 +209,7 @@ func TestMetricsNilMeterProviderFallsBackToNoop(t *testing.T) {
 			Logger: zap.NewNop(),
 		},
 	}
-	conn, err := NewFactory().CreateLogsToTraces(context.Background(), settings, metricsTestConfig(), sink)
+	conn, err := NewFactory().CreateLogsToTraces(t.Context(), settings, metricsTestConfig(), sink)
 	require.NoError(t, err)
 
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
@@ -218,5 +217,5 @@ func TestMetricsNilMeterProviderFallsBackToNoop(t *testing.T) {
 		newLogRecord("user=123 matched", now, "INFO"),
 		newLogRecord("unmatched", now, "INFO"),
 	})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 }

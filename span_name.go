@@ -11,7 +11,7 @@ import (
 )
 
 // defaultSpanNameTemplate is the span_name_template used when the option is
-// absent. It reproduces the historical behaviour of naming the span after the
+// absent. It reproduces the historical behavior of naming the span after the
 // full log body.
 const defaultSpanNameTemplate = "{body}"
 
@@ -110,7 +110,8 @@ func parseSpanNamePlaceholder(expr string) (spanNamePart, error) {
 	default:
 		return spanNamePart{}, fmt.Errorf(
 			"unknown placeholder %q: supported placeholders are {body}, {severity} and {truncated:N:body}",
-			"{"+expr+"}")
+			"{"+expr+"}",
+		)
 	}
 }
 

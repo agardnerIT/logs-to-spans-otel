@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"time"
 )
 
@@ -98,10 +99,8 @@ type Config struct {
 // empty key can never match a log or resource attribute and only hides a typo.
 // field is the mapstructure name, used in the error message.
 func validateAttributeKeys(field string, keys []string) error {
-	for _, key := range keys {
-		if key == "" {
-			return fmt.Errorf("%s must not contain an empty key", field)
-		}
+	if slices.Contains(keys, "") {
+		return fmt.Errorf("%s must not contain an empty key", field)
 	}
 	return nil
 }
@@ -137,7 +136,8 @@ func (cfg *Config) Validate() error {
 
 	if len(cfg.GroupByKeys) == 0 && len(cfg.GroupByAttributes) == 0 {
 		errs = append(errs, errors.New(
-			"at least one of group_by_keys or group_by_attributes must be set: without one every log record is dropped"))
+			"at least one of group_by_keys or group_by_attributes must be set: without one every log record is dropped",
+		))
 	} else if _, err := buildGroupKeyRegexes(cfg.GroupByKeys); err != nil {
 		errs = append(errs, err)
 	}

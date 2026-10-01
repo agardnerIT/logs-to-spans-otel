@@ -4,7 +4,6 @@
 package logs_to_spans
 
 import (
-	"context"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -38,7 +37,7 @@ func newTestSettings() connector.Settings {
 func createTestConnector(t *testing.T, cfg *Config, sink *consumertest.TracesSink) connector.Logs {
 	t.Helper()
 	factory := NewFactory()
-	conn, err := factory.CreateLogsToTraces(context.Background(), newTestSettings(), cfg, sink)
+	conn, err := factory.CreateLogsToTraces(t.Context(), newTestSettings(), cfg, sink)
 	require.NoError(t, err)
 	return conn
 }
@@ -72,7 +71,7 @@ func sendLogs(t *testing.T, conn connector.Logs, records []plog.LogRecord) {
 	for _, lr := range records {
 		lr.CopyTo(sl.LogRecords().AppendEmpty())
 	}
-	err := conn.ConsumeLogs(context.Background(), ld)
+	err := conn.ConsumeLogs(t.Context(), ld)
 	require.NoError(t, err)
 }
 
@@ -88,7 +87,7 @@ func sendLogsWithResource(t *testing.T, conn connector.Logs, res map[string]stri
 	for _, lr := range records {
 		lr.CopyTo(sl.LogRecords().AppendEmpty())
 	}
-	require.NoError(t, conn.ConsumeLogs(context.Background(), ld))
+	require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
 }
 
 // sendLogsWithMultipleResources builds one ResourceLogs per entry, each with its
@@ -107,7 +106,7 @@ func sendLogsWithMultipleResources(t *testing.T, conn connector.Logs, resources 
 			lr.CopyTo(sl.LogRecords().AppendEmpty())
 		}
 	}
-	require.NoError(t, conn.ConsumeLogs(context.Background(), ld))
+	require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
 }
 
 // addTestRecord feeds one record straight into the grouping path with no source
@@ -342,7 +341,7 @@ func TestExtractGroupKey_StructuredNoMatch(t *testing.T) {
 	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 
 	got := conn.(*logsToSpansConnector).extractGroupKey(lr)
-	assert.Equal(t, "", got)
+	assert.Empty(t, got)
 }
 
 func TestBasicGrouping(t *testing.T) {
@@ -480,7 +479,7 @@ func TestShutdown(t *testing.T) {
 	r1 := newLogRecord("user=123 hello", now, "INFO")
 	sendLogs(t, conn, []plog.LogRecord{r1})
 
-	conn.Shutdown(context.Background())
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1, "expected trace export on shutdown")
@@ -681,7 +680,7 @@ func TestDurationFromIntAttribute(t *testing.T) {
 	lr.Body().SetStr("user=123 first")
 	lr.Attributes().PutInt("duration_ns", 2)
 
-	err := conn.ConsumeLogs(context.Background(), logs)
+	err := conn.ConsumeLogs(t.Context(), logs)
 	require.NoError(t, err)
 
 	time.Sleep(300 * time.Millisecond)
@@ -716,7 +715,7 @@ func TestTimestampPriorityOverObservedTimestamp(t *testing.T) {
 	lr.SetTimestamp(pcommon.NewTimestampFromTime(eventTS))
 	lr.Body().SetStr("user=123 hello")
 
-	err := conn.ConsumeLogs(context.Background(), logs)
+	err := conn.ConsumeLogs(t.Context(), logs)
 	require.NoError(t, err)
 
 	time.Sleep(300 * time.Millisecond)
@@ -779,7 +778,7 @@ func TestCompiledRegexReuseAcrossMultipleCalls(t *testing.T) {
 
 	c := conn.(*logsToSpansConnector)
 
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		lr := newLogRecord("user=999 message", time.Now(), "INFO")
 		got := c.extractGroupKey(lr)
 		assert.Equal(t, "999", got)
@@ -829,7 +828,7 @@ func TestFactoryReturnsErrorForEmptyGroupByKey(t *testing.T) {
 	cfg.GroupByKeys = []string{""}
 	factory := NewFactory()
 
-	_, err := factory.CreateLogsToTraces(context.Background(), newTestSettings(), cfg, newTestSink())
+	_, err := factory.CreateLogsToTraces(t.Context(), newTestSettings(), cfg, newTestSink())
 	require.Error(t, err, "the factory must return an error, not panic")
 }
 
@@ -879,7 +878,7 @@ func TestConfigValidateNegativeEndSpanDuration(t *testing.T) {
 }
 
 // Records that match no group key are always dropped. #8 removed the
-// unmatched_behaviour option: pass_through was never implemented (the
+// unmatched_behavior option: pass_through was never implemented (the
 // connector registers no logs consumer, so it cannot emit log records). Split
 // logs into matched/unmatched pipelines with the filterprocessor before the
 // connector if unmatched records must be kept.
@@ -944,7 +943,7 @@ func TestFactoryAcceptsAttributesOnlyConfig(t *testing.T) {
 	cfg.GroupByAttributes = []string{"user.id"}
 	factory := NewFactory()
 
-	conn, err := factory.CreateLogsToTraces(context.Background(), newTestSettings(), cfg, newTestSink())
+	conn, err := factory.CreateLogsToTraces(t.Context(), newTestSettings(), cfg, newTestSink())
 	require.NoError(t, err)
 	assert.Empty(t, conn.(*logsToSpansConnector).compiledRegex,
 		"attribute-only configs compile no body regexes")
@@ -1023,14 +1022,14 @@ func TestConsumeLogsDoesNotRetainSourcePdata(t *testing.T) {
 	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	lr.SetSeverityText("INFO")
 
-	require.NoError(t, conn.ConsumeLogs(context.Background(), ld))
+	require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
 
 	// Overwrite the source in place, the way a receiver reusing its batch
 	// buffers would once ConsumeLogs has returned.
 	lr.Body().Map().PutStr("message", "mutated message")
 	lr.SetSeverityText("DEBUG")
 
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
@@ -1052,7 +1051,7 @@ func TestStartReturnsNil(t *testing.T) {
 	cfg := createDefaultConfig()
 	conn := createTestConnector(t, cfg, sink)
 
-	err := conn.Start(context.Background(), nil)
+	err := conn.Start(t.Context(), nil)
 	assert.NoError(t, err)
 }
 
@@ -1061,7 +1060,7 @@ func TestShutdownWithNoGroups(t *testing.T) {
 	cfg := createDefaultConfig()
 	conn := createTestConnector(t, cfg, sink)
 
-	err := conn.Shutdown(context.Background())
+	err := conn.Shutdown(t.Context())
 	assert.NoError(t, err)
 	assert.Empty(t, sink.AllTraces())
 }
@@ -1076,8 +1075,8 @@ func TestMultipleShutdownCalls(t *testing.T) {
 	r1 := newLogRecord("user=123 hello", now, "INFO")
 	sendLogs(t, conn, []plog.LogRecord{r1})
 
-	require.NoError(t, conn.Shutdown(context.Background()))
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 }
 
 func TestShutdownThenConsumeLogs(t *testing.T) {
@@ -1086,11 +1085,11 @@ func TestShutdownThenConsumeLogs(t *testing.T) {
 	cfg.GroupByKeys = []string{"user"}
 	conn := createTestConnector(t, cfg, sink)
 
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	now := time.Now()
 	r1 := newLogRecord("user=456 should be dropped", now, "INFO")
-	err := conn.ConsumeLogs(context.Background(), plog.NewLogs())
+	err := conn.ConsumeLogs(t.Context(), plog.NewLogs())
 	require.NoError(t, err)
 	_ = r1
 
@@ -1119,7 +1118,7 @@ func TestMultipleResourceLogsEntries(t *testing.T) {
 	lr2.SetObservedTimestamp(pcommon.NewTimestampFromTime(now.Add(1 * time.Second)))
 	lr2.Body().SetStr("user=111 second")
 
-	err := conn.ConsumeLogs(context.Background(), ld)
+	err := conn.ConsumeLogs(t.Context(), ld)
 	require.NoError(t, err)
 
 	time.Sleep(300 * time.Millisecond)
@@ -1151,7 +1150,7 @@ func TestMultipleScopeLogsEntries(t *testing.T) {
 	lr2.SetObservedTimestamp(pcommon.NewTimestampFromTime(now.Add(1 * time.Second)))
 	lr2.Body().SetStr("user=222 second")
 
-	err := conn.ConsumeLogs(context.Background(), ld)
+	err := conn.ConsumeLogs(t.Context(), ld)
 	require.NoError(t, err)
 
 	time.Sleep(300 * time.Millisecond)
@@ -1336,7 +1335,7 @@ func TestDurationFromDoubleAttribute(t *testing.T) {
 	lr.Body().SetStr("user=123 first")
 	lr.Attributes().PutDouble("dur", 1.5)
 
-	err := conn.ConsumeLogs(context.Background(), logs)
+	err := conn.ConsumeLogs(t.Context(), logs)
 	require.NoError(t, err)
 
 	time.Sleep(300 * time.Millisecond)
@@ -1367,7 +1366,7 @@ func TestDurationFromInvalidStringAttribute(t *testing.T) {
 	lr.Body().SetStr("user=123 first")
 	lr.Attributes().PutStr("dur", "not-a-duration")
 
-	err := conn.ConsumeLogs(context.Background(), logs)
+	err := conn.ConsumeLogs(t.Context(), logs)
 	require.NoError(t, err)
 
 	time.Sleep(300 * time.Millisecond)
@@ -1487,7 +1486,7 @@ func TestObservedTimestampUsedWhenNoTimestamp(t *testing.T) {
 	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(observedTS))
 	lr.Body().SetStr("user=123 hello")
 
-	err := conn.ConsumeLogs(context.Background(), logs)
+	err := conn.ConsumeLogs(t.Context(), logs)
 	require.NoError(t, err)
 
 	time.Sleep(200 * time.Millisecond)
@@ -1538,7 +1537,7 @@ func TestStructMapBodyAllEmptyReturnsEmpty(t *testing.T) {
 
 	c := conn.(*logsToSpansConnector)
 	got := c.extractGroupKey(lr)
-	assert.Equal(t, "", got, "all empty values should return empty")
+	assert.Empty(t, got, "all empty values should return empty")
 }
 
 func TestUnstructuredKeyValueWithHyphen(t *testing.T) {
@@ -1681,11 +1680,11 @@ func TestMaxGroupsEvictionPreservesEveryRecord(t *testing.T) {
 	c := conn.(*logsToSpansConnector)
 
 	const keys = 7
-	for i := 0; i < keys; i++ {
+	for i := range keys {
 		addTestRecord(c, fmt.Sprintf("key-%d", i), newLogRecord(fmt.Sprintf("user=%d log", i), time.Now(), "INFO"))
 	}
 
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	seen := 0
 	for _, td := range sink.AllTraces() {
@@ -1704,7 +1703,7 @@ func TestMaxGroupsZeroMeansUnlimited(t *testing.T) {
 	conn := createTestConnector(t, cfg, sink)
 	c := conn.(*logsToSpansConnector)
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		addTestRecord(c, fmt.Sprintf("key-%d", i), newLogRecord(fmt.Sprintf("user=%d log", i), time.Now(), "INFO"))
 	}
 
@@ -1820,7 +1819,7 @@ func TestMaxLogsPerTraceFlushesAtLimit(t *testing.T) {
 	r5 := newLogRecord("user=123 log5", now.Add(4*time.Second), "INFO")
 
 	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4, r5})
-	conn.Shutdown(context.Background())
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 2, "expected 2 traces: 3 logs in first, 2 in second")
@@ -1888,7 +1887,7 @@ func TestMaxLogsPerTraceZeroMeansNoLimit(t *testing.T) {
 
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 	records := make([]plog.LogRecord, 10)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		records[i] = newLogRecord("user=123 log", now.Add(time.Duration(i)*time.Second), "INFO")
 	}
 
@@ -1917,7 +1916,7 @@ func TestMaxLogsPerTraceSpanLinks(t *testing.T) {
 	r4 := newLogRecord("user=123 log4", now.Add(3*time.Second), "INFO")
 
 	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4})
-	conn.Shutdown(context.Background())
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 2)
@@ -1944,7 +1943,7 @@ func TestMaxLogsPerTraceSpanLinkChain(t *testing.T) {
 
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 	records := make([]plog.LogRecord, 9)
-	for i := 0; i < 9; i++ {
+	for i := range 9 {
 		records[i] = newLogRecord("user=123 log", now.Add(time.Duration(i)*time.Second), "INFO")
 	}
 
@@ -1986,7 +1985,7 @@ func TestMaxLogsPerTraceSeparateGroups(t *testing.T) {
 	r6 := newLogRecord("user=bbb log3", now.Add(2*time.Second), "INFO")
 
 	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4, r5, r6})
-	conn.Shutdown(context.Background())
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 4, "expected 4 traces: 2 per user")
@@ -2077,7 +2076,7 @@ func TestStaleTimerCallbackDoesNotEvictReplacementGroup(t *testing.T) {
 
 	// g2 keeps collecting, and its trace links back to the split trace.
 	addTestRecord(c, "user=123", newLogRecord("user=123 log3", now.Add(2*time.Second), "INFO"))
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 2, "records held by g2 must not be lost")
@@ -2135,23 +2134,23 @@ func TestConcurrentSplitAndFlush(t *testing.T) {
 	const perGoroutine = 100
 
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for i := 0; i < perGoroutine; i++ {
+			for i := range perGoroutine {
 				ld := plog.NewLogs()
 				sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
 				lr := sl.LogRecords().AppendEmpty()
 				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 				lr.Body().SetStr(fmt.Sprintf("user=%d log%d", id%4, i))
-				_ = conn.ConsumeLogs(context.Background(), ld)
+				_ = conn.ConsumeLogs(t.Context(), ld)
 			}
 		}(g)
 	}
 	wg.Wait()
 
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	seen := 0
 	for _, td := range sink.AllTraces() {
@@ -2174,7 +2173,7 @@ func TestCopyResourceAttributesToOutput(t *testing.T) {
 		"k8s.pod.name":        "pod-a",
 		"service.instance.id": "inst-1",
 	}, []plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
@@ -2199,7 +2198,7 @@ func TestCopyResourceAttributesDisabled(t *testing.T) {
 		"host.name":    "node-1",
 		"service.name": "source-svc",
 	}, []plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
@@ -2221,7 +2220,7 @@ func TestServiceNamePreservedFromSource(t *testing.T) {
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 	sendLogsWithResource(t, conn, map[string]string{"service.name": "source-svc"},
 		[]plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
@@ -2241,7 +2240,7 @@ func TestServiceNameExplicitOverridesSource(t *testing.T) {
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 	sendLogsWithResource(t, conn, map[string]string{"service.name": "source-svc"},
 		[]plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
@@ -2252,7 +2251,7 @@ func TestServiceNameExplicitOverridesSource(t *testing.T) {
 
 // Without group_by_resource_attributes the same key from different resources
 // merges into one group. The first record's resource wins, which is the
-// documented collapsing behaviour.
+// documented collapsing behavior.
 func TestMergedGroupUsesFirstResource(t *testing.T) {
 	sink := newTestSink()
 	cfg := createDefaultConfig()
@@ -2269,7 +2268,7 @@ func TestMergedGroupUsesFirstResource(t *testing.T) {
 			{newLogRecord("user=123 first", now, "INFO")},
 			{newLogRecord("user=123 second", now.Add(time.Second), "INFO")},
 		})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1, "resource attributes do not scope groups by default")
@@ -2296,7 +2295,7 @@ func TestGroupByResourceAttributesSeparatesGroups(t *testing.T) {
 			{newLogRecord("user=123 from a", now, "INFO")},
 			{newLogRecord("user=123 from b", now.Add(time.Second), "INFO")},
 		})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 2, "the same key from different services must not merge")
@@ -2331,7 +2330,7 @@ func TestGroupByResourceAttributesMissingAttributeCollapses(t *testing.T) {
 			{newLogRecord("user=123 first", now, "INFO")},
 			{newLogRecord("user=123 second", now.Add(time.Second), "INFO")},
 		})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1, "resources missing the scoping attribute collapse together")
@@ -2353,7 +2352,7 @@ func TestSplitReplacementKeepsResource(t *testing.T) {
 			newLogRecord("user=123 log1", now, "INFO"),
 			newLogRecord("user=123 log2", now.Add(time.Second), "INFO"),
 		})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 2, "max_logs_per_trace 1 splits each record")
@@ -2388,9 +2387,9 @@ func traceIDFromHex(t *testing.T, s string) pcommon.TraceID {
 	return id
 }
 
-func spanIDFromHex(t *testing.T, s string) pcommon.SpanID {
+func spanIDFromHex(t *testing.T) pcommon.SpanID {
 	t.Helper()
-	b, err := hex.DecodeString(s)
+	b, err := hex.DecodeString(testSpanIDHex)
 	require.NoError(t, err)
 	var id pcommon.SpanID
 	copy(id[:], b)
@@ -2407,11 +2406,11 @@ func TestExtractTraceContextFromRecord(t *testing.T) {
 	cfg := createDefaultConfig()
 	lr := newLogRecord("user=123 log", time.Now(), "INFO")
 	lr.SetTraceID(traceIDFromHex(t, testTraceIDHex))
-	lr.SetSpanID(spanIDFromHex(t, testSpanIDHex))
+	lr.SetSpanID(spanIDFromHex(t))
 
 	traceID, spanID := extractTraceContext(lr, cfg)
 	assert.Equal(t, traceIDFromHex(t, testTraceIDHex), traceID)
-	assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID)
+	assert.Equal(t, spanIDFromHex(t), spanID)
 }
 
 func TestExtractTraceContextFromAttributes(t *testing.T) {
@@ -2431,7 +2430,7 @@ func TestExtractTraceContextFromAttributes(t *testing.T) {
 			})
 			traceID, spanID := extractTraceContext(lr, cfg)
 			assert.Equal(t, traceIDFromHex(t, testTraceIDHex), traceID)
-			assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID)
+			assert.Equal(t, spanIDFromHex(t), spanID)
 		})
 	}
 }
@@ -2440,19 +2439,19 @@ func TestExtractTraceContextFromBytesAttributes(t *testing.T) {
 	cfg := createDefaultConfig()
 	lr := newLogRecord("user=123 log", time.Now(), "INFO")
 	traceBytes := traceIDFromHex(t, testTraceIDHex)
-	spanBytes := spanIDFromHex(t, testSpanIDHex)
+	spanBytes := spanIDFromHex(t)
 	lr.Attributes().PutEmptyBytes("trace_id").FromRaw(traceBytes[:])
 	lr.Attributes().PutEmptyBytes("span_id").FromRaw(spanBytes[:])
 
 	traceID, spanID := extractTraceContext(lr, cfg)
 	assert.Equal(t, traceIDFromHex(t, testTraceIDHex), traceID)
-	assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID)
+	assert.Equal(t, spanIDFromHex(t), spanID)
 }
 
 func TestExtractTraceContextRecordWinsOverAttribute(t *testing.T) {
 	cfg := createDefaultConfig()
 	recordTraceID := traceIDFromHex(t, testTraceIDHex)
-	recordSpanID := spanIDFromHex(t, testSpanIDHex)
+	recordSpanID := spanIDFromHex(t)
 	lr := newLogRecordWithAttrs("user=123 log", time.Now(), "INFO", map[string]string{
 		"trace_id": "11111111111111111111111111111111",
 		"span_id":  "2222222222222222",
@@ -2477,7 +2476,7 @@ func TestExtractTraceContextCustomKeys(t *testing.T) {
 
 	traceID, spanID := extractTraceContext(lr, cfg)
 	assert.Equal(t, traceIDFromHex(t, testTraceIDHex), traceID, "custom key wins and the defaults are not consulted")
-	assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID)
+	assert.Equal(t, spanIDFromHex(t), spanID)
 }
 
 func TestExtractTraceContextIgnoresInvalidAndEmptyIDs(t *testing.T) {
@@ -2496,7 +2495,7 @@ func TestExtractTraceContextIgnoresInvalidAndEmptyIDs(t *testing.T) {
 			})
 			traceID, spanID := extractTraceContext(lr, cfg)
 			assert.True(t, traceID.IsEmpty(), "an invalid trace ID must be ignored")
-			assert.Equal(t, spanIDFromHex(t, testSpanIDHex), spanID,
+			assert.Equal(t, spanIDFromHex(t), spanID,
 				"a bad trace ID must not discard a valid span ID")
 		})
 	}
@@ -2524,13 +2523,13 @@ func TestRecordTraceContextProducesSpanLink(t *testing.T) {
 	conn := createTestConnector(t, cfg, sink)
 
 	originTrace := traceIDFromHex(t, testTraceIDHex)
-	originSpan := spanIDFromHex(t, testSpanIDHex)
+	originSpan := spanIDFromHex(t)
 	lr := newLogRecord("user=123 log", time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC), "INFO")
 	lr.SetTraceID(originTrace)
 	lr.SetSpanID(originSpan)
 
 	sendLogs(t, conn, []plog.LogRecord{lr})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
@@ -2551,14 +2550,14 @@ func TestAttributeTraceContextProducesSpanLink(t *testing.T) {
 		map[string]string{"trace_id": testTraceIDHex, "span_id": testSpanIDHex})
 
 	sendLogs(t, conn, []plog.LogRecord{lr})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
 	require.Equal(t, 1, span.Links().Len())
 	assert.Equal(t, traceIDFromHex(t, testTraceIDHex), span.Links().At(0).TraceID())
-	assert.Equal(t, spanIDFromHex(t, testSpanIDHex), span.Links().At(0).SpanID())
+	assert.Equal(t, spanIDFromHex(t), span.Links().At(0).SpanID())
 }
 
 func TestEachRecordLinksToItsOwnOrigin(t *testing.T) {
@@ -2577,7 +2576,7 @@ func TestEachRecordLinksToItsOwnOrigin(t *testing.T) {
 	r2.SetTraceID(originB)
 
 	sendLogs(t, conn, []plog.LogRecord{r1, r2})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
@@ -2599,7 +2598,7 @@ func TestNoTraceContextProducesNoLinks(t *testing.T) {
 	sendLogs(t, conn, []plog.LogRecord{
 		newLogRecord("user=123 log", time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC), "INFO"),
 	})
-	require.NoError(t, conn.Shutdown(context.Background()))
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 1)
@@ -2625,7 +2624,7 @@ func TestOriginatingAndChainLinksCoexist(t *testing.T) {
 	r2.SetTraceID(originB)
 
 	sendLogs(t, conn, []plog.LogRecord{r1, r2})
-	conn.Shutdown(context.Background())
+	require.NoError(t, conn.Shutdown(t.Context()))
 
 	traces := sink.AllTraces()
 	require.Len(t, traces, 2)

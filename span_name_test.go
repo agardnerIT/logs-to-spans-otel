@@ -4,7 +4,6 @@
 package logs_to_spans
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -75,7 +74,7 @@ func TestTruncateRunes(t *testing.T) {
 	assert.Equal(t, "hé", truncateRunes("héllo", 2))
 	assert.Equal(t, "héllo", truncateRunes("héllo", 5))
 	assert.Equal(t, "héllo", truncateRunes("héllo", 99))
-	assert.Equal(t, "", truncateRunes("héllo", 0))
+	assert.Empty(t, truncateRunes("héllo", 0))
 	assert.Equal(t, "日本", truncateRunes("日本語", 2))
 }
 
@@ -190,7 +189,7 @@ func TestFactoryRejectsInvalidSpanNameTemplate(t *testing.T) {
 	cfg.SpanNameTemplate = "{truncated:oops:body}"
 
 	factory := NewFactory()
-	_, err := factory.CreateLogsToTraces(context.Background(), newTestSettings(), cfg, newTestSink())
+	_, err := factory.CreateLogsToTraces(t.Context(), newTestSettings(), cfg, newTestSink())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "span_name_template")
 }

@@ -72,7 +72,7 @@ type logRecord struct {
 	spanID  pcommon.SpanID
 }
 
-func (c *logsToSpansConnector) Capabilities() consumer.Capabilities {
+func (*logsToSpansConnector) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: false}
 }
 
@@ -85,7 +85,7 @@ func (c *logsToSpansConnector) activeGroupCount() int64 {
 	return int64(len(c.groups))
 }
 
-func (c *logsToSpansConnector) Start(_ context.Context, _ component.Host) error {
+func (*logsToSpansConnector) Start(_ context.Context, _ component.Host) error {
 	return nil
 }
 
@@ -106,8 +106,8 @@ func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) er
 
 				// Extract the record before taking the lock. The body/severity
 				// conversion is the dominant per-record cost (for a Map body
-				// valueToString serialises it to JSON while it runs), and running it
-				// inside c.mu serialised every core against all groups and timer
+				// valueToString serializes it to JSON while it runs), and running it
+				// inside c.mu serialized every core against all groups and timer
 				// callbacks. The result is an immutable copy, so addToGroup only does
 				// map/list work under the lock. Extraction must stay eager: plog values
 				// are views into upstream-owned pdata and must not be retained past
@@ -606,11 +606,12 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 		span.SetKind(ptrace.SpanKindInternal)
 
 		var endTime time.Time
-		if rec.duration > 0 {
+		switch {
+		case rec.duration > 0:
 			endTime = rec.timestamp.Add(rec.duration)
-		} else if i < len(group.records)-1 {
+		case i < len(group.records)-1:
 			endTime = group.records[i+1].timestamp
-		} else {
+		default:
 			endTime = rec.timestamp.Add(c.config.EndSpanDuration)
 		}
 		span.SetEndTimestamp(pcommon.NewTimestampFromTime(endTime))

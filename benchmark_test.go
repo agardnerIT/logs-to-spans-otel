@@ -4,7 +4,6 @@
 package logs_to_spans
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -21,13 +20,13 @@ const benchBatchSize = 100
 // newStructuredBenchmarkLogs builds a batch of log records with a Map body, the
 // shape a JSON log receiver produces. Body extraction for this shape is the
 // cost issue #15 moved out of the connector's global mutex: valueToString calls
-// Value.AsString(), which serialises the whole body to a string.
+// Value.AsString(), which serializes the whole body to a string.
 func newStructuredBenchmarkLogs(n int) plog.Logs {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.Resource().Attributes().PutStr("service.name", "benchmark")
 	sl := rl.ScopeLogs().AppendEmpty()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		lr := sl.LogRecords().AppendEmpty()
 		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Unix(0, int64(i))))
 		lr.SetSeverityText("INFO")
@@ -59,9 +58,9 @@ func newBenchmarkConnector(b *testing.B) *logsToSpansConnector {
 
 	factory := NewFactory()
 	// A nop traces consumer, not a recording sink: consumertest.TracesSink takes
-	// its own mutex, which would serialise the parallel benchmark and hide what
+	// its own mutex, which would serialize the parallel benchmark and hide what
 	// the connector's own lock does.
-	conn, err := factory.CreateLogsToTraces(context.Background(), newTestSettings(), cfg, consumertest.NewNop())
+	conn, err := factory.CreateLogsToTraces(b.Context(), newTestSettings(), cfg, consumertest.NewNop())
 	require.NoError(b, err)
 	return conn.(*logsToSpansConnector)
 }
@@ -71,10 +70,10 @@ func newBenchmarkConnector(b *testing.B) *logsToSpansConnector {
 // mostly shows the extraction cost itself.
 func BenchmarkConsumeLogsStructured(b *testing.B) {
 	conn := newBenchmarkConnector(b)
-	defer func() { require.NoError(b, conn.Shutdown(context.Background())) }()
+	defer func() { require.NoError(b, conn.Shutdown(b.Context())) }()
 
 	ld := newStructuredBenchmarkLogs(benchBatchSize)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -87,16 +86,16 @@ func BenchmarkConsumeLogsStructured(b *testing.B) {
 // BenchmarkConsumeLogsStructuredParallel runs concurrent ConsumeLogs callers
 // against one connector. Before issue #15 this is where the global mutex bit:
 // the map-body JSON conversion ran inside the critical section shared by all
-// groups and timer callbacks, serialising every core. After the fix only the
+// groups and timer callbacks, serializing every core. After the fix only the
 // map/list splice stays under the lock, so this case now runs faster than the
 // single-goroutine baseline instead of slower. It does not scale linearly:
-// timer Stop + AfterFunc per record is still serialised by the lock.
+// timer Stop + AfterFunc per record is still serialized by the lock.
 func BenchmarkConsumeLogsStructuredParallel(b *testing.B) {
 	conn := newBenchmarkConnector(b)
-	defer func() { require.NoError(b, conn.Shutdown(context.Background())) }()
+	defer func() { require.NoError(b, conn.Shutdown(b.Context())) }()
 
 	ld := newStructuredBenchmarkLogs(benchBatchSize)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -112,7 +111,7 @@ func BenchmarkConsumeLogsStructuredParallel(b *testing.B) {
 }
 
 // BenchmarkExtractLogRecord isolates the extraction the fix moved out of the
-// mutex, so the serialised cost removed from the critical section is visible on
+// mutex, so the serialized cost removed from the critical section is visible on
 // its own.
 func BenchmarkExtractLogRecord(b *testing.B) {
 	ld := newStructuredBenchmarkLogs(1)

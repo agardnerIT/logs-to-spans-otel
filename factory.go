@@ -41,7 +41,7 @@ func createLogsToTraces(
 
 	// As with the regexes above, Validate compiles the template and reports a
 	// useful error, but the factory can be reached without Validate. An absent
-	// template means the default body-as-name behaviour.
+	// template means the default body-as-name behavior.
 	tmpl := c.SpanNameTemplate
 	if tmpl == "" {
 		tmpl = defaultSpanNameTemplate

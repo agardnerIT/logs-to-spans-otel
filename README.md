@@ -414,6 +414,7 @@ ocb --config builder-config.yaml
 
 - Go 1.26+
 - OpenTelemetry Collector Builder (`ocb`) — [install from releases](https://github.com/open-telemetry/opentelemetry-collector-releases) (this repo builds against OCB v0.162.0)
+- `golangci-lint` v2.13.2 for linting — install with the command in [Lint](#lint)
 
 ### Tests
 
@@ -436,6 +437,17 @@ The test suite covers:
 - Unmatched records being dropped without creating a trace
 - Concurrent consumption during splits and timer callbacks (run under `-race`)
 - Eager extraction: mutating a source log record after `ConsumeLogs` returns does not change the emitted span
+
+### Lint
+
+```sh
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+golangci-lint run ./...
+```
+
+CI runs the same command with the same pinned version ([`.golangci.yml`](.golangci.yml)). The config mirrors the linter set and settings of opentelemetry-collector-contrib's root `.golangci.yml`, so contrib's stricter `make lint` gate does not surface a backlog of mechanical fixes on the donation pull request. It drops the contrib-tree paths that do not exist here; the `gci` import prefix is this repo's module path until the donation rename. `go vet` is still run as its own CI step: the `govet` linter subsumes it, but the standalone step fails faster and is easier to read.
+
+`gci` and `gofumpt` are formatters in golangci-lint v2. They are checked by `golangci-lint run` and can be applied with `golangci-lint fmt`.
 
 ### Benchmarks
 
@@ -465,6 +477,7 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ```
 .
+├── .golangci.yml                # Lint config (mirrors contrib's)
 ├── LICENSE                      # Apache 2.0
 ├── Makefile                     # includes contrib Makefile.Common at donation time
 ├── README.md
@@ -494,6 +507,7 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Added contrib-level linting ([#19](https://github.com/agardnerIT/logs-to-spans-otel/issues/19)): a [`.golangci.yml`](.golangci.yml) mirroring opentelemetry-collector-contrib's root config (same linter set and settings, minus the contrib-tree paths that do not exist here) and a `lint` CI job running golangci-lint v2.13.2, the version contrib pins in `internal/tools/go.mod`. The first run is clean; the findings it surfaced are fixed in the same change (test context handling, an if/else chain, empty-assertion style, spelling and formatting). `go vet` is retained as a separate fast step. No user-visible behaviour change.
 - Documentation fixes: the "Including in your own collector build" snippet now matches the collector line this repo builds against (`v0.162.0` core and contrib, `v1.68.0` providers), the Go prerequisite is `1.26+`, the local-development note describes the `replaces:` block the repo actually uses, and a dead Dockerfile link was removed.
 
 ### v0.5.0

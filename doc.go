@@ -7,7 +7,7 @@
 // span in that trace.
 //
 // The package is a connector: it consumes logs and produces traces. See the
-// repository README for the configuration reference and behaviour.
+// repository README for the configuration reference and behavior.
 //
 // At donation to opentelemetry-collector-contrib this package moves to
 // connector/logstospansconnector and the import path below changes to
