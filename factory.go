@@ -6,6 +6,7 @@
 package logs_to_spans
 
 import (
+	"container/list"
 	"context"
 
 	"go.opentelemetry.io/collector/component"
@@ -56,6 +57,7 @@ func createLogsToTraces(
 		logger:         set.Logger,
 		tracesConsumer: tracesConsumer,
 		groups:         make(map[string]*logGroup),
+		lru:            list.New(),
 		compiledRegex:  compiledRegex,
 		spanName:       spanName,
 	}

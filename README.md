@@ -223,19 +223,21 @@ service:
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
 | `span_name_template` | string | `"{body}"` | Template for the span name. Placeholders: `{body}` (full log body), `{severity}` (severity text), `{truncated:N:body}` (first N characters of the body). Unknown or malformed placeholders are a startup error; an empty render falls back to the body. See [Span naming](#span-naming). |
 
-> **`timeout` vs `max_wait`:** `timeout` is a *sliding* inactivity window — it resets every time a new log arrives. `max_wait` is a *fixed* deadline from the moment the group is created. A group is flushed when *either* timer fires first.
+> **`timeout` vs `max_wait`:** `timeout` is a *sliding* inactivity window — it resets every time a new log arrives. `max_wait` is a *fixed* deadline from the moment the group is created. A group is flushed when *either* deadline passes first.
+
+> **Flush deadlines are checked by one background reaper.** The connector runs a single goroutine that scans buffered groups on a tick — a quarter of the shorter of `timeout` and `max_wait`, clamped to between 10ms and 1s — and flushes those past either deadline. There are no per-group timers, so a group can be emitted up to one tick after its deadline. `max_wait` still caps a group's absolute lifetime, and the reaper is stopped deterministically on `Shutdown`. ([#20](https://github.com/agardnerIT/logs-to-spans-otel/issues/20))
 
 ### Bounding memory with `max_groups`
 
-`max_logs_per_trace` bounds the size of one group and `max_wait` bounds how long any group lives, but neither bounds how many groups exist at once. A high-cardinality key — a per-request UUID, a connection ID, a raw trace ID — would otherwise add one map entry and two live timers per distinct value. `max_groups` is that bound.
+`max_logs_per_trace` bounds the size of one group and `max_wait` bounds how long any group lives, but neither bounds how many groups exist at once. A high-cardinality key — a per-request UUID, a connection ID, a raw trace ID — would otherwise add one unbounded map entry per distinct value until it timed out. `max_groups` is that bound.
 
-When a log record opens a group and the map already holds `max_groups` groups, the connector evicts the **least recently updated** group (ties broken by key, so the choice is deterministic) before admitting the new one. Eviction is a normal flush: the group's records are sorted, converted to a trace, and emitted. Nothing is dropped, but that key gets its trace boundary earlier than its `timeout` or `max_wait` would have produced.
+When a log record opens a group and the map already holds `max_groups` groups, the connector evicts the **least recently updated** group before admitting the new one. Recency is tracked by an LRU list, so the choice is deterministic and eviction is O(1). Eviction is a normal flush: the group's records are sorted, converted to a trace, and emitted. Nothing is dropped, but that key gets its trace boundary earlier than its `timeout` or `max_wait` would have produced.
 
 Eviction happens only when a **new** key is opened. Adding records to a group that is already buffered never evicts it, so a hot key is never split by the cap.
 
 Set `max_groups: 0` to disable the cap — the same convention as `max_logs_per_trace: 0`. It is not recommended for keys you do not control: memory then grows with the number of distinct keys until each group times out. `max_wait` is already the per-group TTL, so there is no separate TTL option.
 
-Use the `groups_evicted` counter and `active_groups` gauge (see [Produced metrics](#produced-metrics)) to see the cap working. The search for the least recently updated group is linear in `max_groups` and runs only when the cap is reached.
+Use the `groups_evicted` counter and `active_groups` gauge (see [Produced metrics](#produced-metrics)) to see the cap working. Eviction reads the tail of an LRU list, so it never scans the map.
 
 ### Example
 
@@ -432,10 +434,11 @@ The test suite covers:
 - Service name propagation
 - `max_logs_per_trace` limit, span links, and chain behaviour
 - Originating trace context from the record and from attributes, span-link emission, and invalid or all-zero ID handling
-- Stale-timer safety after a `max_logs_per_trace` split, and flush idempotency
+- Split-replacement safety after a `max_logs_per_trace` split, and flush idempotency
+- Batch grouping: interleaved records for different keys in one `ConsumeLogs` call still form separate groups and keep the input order
 - Source resource attribute copying, `group_by_resource_attributes` scoping, and `service.name` precedence across multiple resources
 - Unmatched records being dropped without creating a trace
-- Concurrent consumption during splits and timer callbacks (run under `-race`)
+- Concurrent consumption during `max_logs_per_trace` splits and reaper flushes (run under `-race`)
 - Eager extraction: mutating a source log record after `ConsumeLogs` returns does not change the emitted span
 
 ### Lint
@@ -457,8 +460,9 @@ go test -run '^$' -bench . -benchmem ./...
 
 `benchmark_test.go` measures the per-record path on a structured (Map) body:
 
-- `BenchmarkConsumeLogsStructured` — single caller, the cost of extraction itself
-- `BenchmarkConsumeLogsStructuredParallel` — concurrent callers against one connector, where the global mutex used to serialise every core ([#15](https://github.com/agardnerIT/logs-to-spans-otel/issues/15))
+- `BenchmarkConsumeLogsStructured` — single caller, the cost of extraction plus the group-map splice
+- `BenchmarkConsumeLogsStructuredParallel` — concurrent callers against one connector, with `max_logs_per_trace` disabled so the measurement is the group-map path alone. This is the case the global mutex used to serialise ([#15](https://github.com/agardnerIT/logs-to-spans-otel/issues/15), [#20](https://github.com/agardnerIT/logs-to-spans-otel/issues/20)).
+- `BenchmarkConsumeLogsStructuredParallelSplits` — the same parallel workload with `max_logs_per_trace: 1000`, so each split also builds and emits a trace. That trace construction, not the connector lock, dominates the allocation profile and the 8-core number.
 - `BenchmarkExtractLogRecord` — the extraction the fix moved out of the critical section, measured on its own
 
 ### Quick start with filelog
@@ -507,6 +511,7 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Removed the last per-record work from the connector's global mutex ([#20](https://github.com/agardnerIT/logs-to-spans-otel/issues/20)). After [#15](https://github.com/agardnerIT/logs-to-spans-otel/issues/15) moved body extraction out of the lock, `addToGroup` still took `c.mu` once per record for a `time.AfterFunc` stop/reset, a resource-attribute deep copy on group creation, and an O(`max_groups`) eviction scan. Now: a single background reaper owns every `timeout`/`max_wait` deadline (one ticker scan instead of two timer create/stop operations per log), there are no per-group timers at all; new groups' resource attributes are deep-copied before the lock; `max_groups` eviction is O(1) off an LRU list; and `ConsumeLogs` batches a batch's records by group key so the lock is taken once per group per call instead of once per record. Flush timing is now bounded by the reaper tick (a quarter of the shorter deadline, clamped to 10ms–1s); `timeout` and `max_wait` semantics are otherwise unchanged, and the reaper is stopped deterministically on `Shutdown`. On an 8-core Apple M2 the parallel grouping benchmark (`max_logs_per_trace` disabled) runs at ~1.5M logs/sec, ~3x the ~495k single-caller baseline, and `addToGroup` falls from ~92% to ~5% of mutex-contention delay; with `max_logs_per_trace` enabled the full pipeline runs at ~735k logs/sec (~1.6x), bound by GC on trace construction rather than the lock. No config surface change.
 - Added contrib-level linting ([#19](https://github.com/agardnerIT/logs-to-spans-otel/issues/19)): a [`.golangci.yml`](.golangci.yml) mirroring opentelemetry-collector-contrib's root config (same linter set and settings, minus the contrib-tree paths that do not exist here) and a `lint` CI job running golangci-lint v2.13.2, the version contrib pins in `internal/tools/go.mod`. The first run is clean; the findings it surfaced are fixed in the same change (test context handling, an if/else chain, empty-assertion style, spelling and formatting). `go vet` is retained as a separate fast step. No user-visible behaviour change.
 - Documentation fixes: the "Including in your own collector build" snippet now matches the collector line this repo builds against (`v0.162.0` core and contrib, `v1.68.0` providers), the Go prerequisite is `1.26+`, the local-development note describes the `replaces:` block the repo actually uses, and a dead Dockerfile link was removed.
 

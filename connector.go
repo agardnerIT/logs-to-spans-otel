@@ -4,6 +4,7 @@
 package logs_to_spans
 
 import (
+	"container/list"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -27,36 +28,56 @@ import (
 type logsToSpansConnector struct {
 	config         *Config
 	logger         *zap.Logger
-	groups         map[string]*logGroup
 	tracesConsumer consumer.Traces
-	mu             sync.Mutex
-	stopped        bool
 	compiledRegex  []*regexp.Regexp
 	spanName       *spanNameTemplate
 	telemetry      *metadata.TelemetryBuilder
+
+	// mu guards every field below plus the groups map. The per-record path only
+	// takes it for the O(1) map/list splice; deadline checks, resource copying
+	// and eviction selection no longer run under it. See reapExpired.
+	mu      sync.Mutex
+	groups  map[string]*logGroup
+	lru     *list.List // container/list of *logGroup, front = most recently updated
+	stopped bool
+
+	// reaperStop/reaperDone are the lifecycle handles of the single background
+	// reaper goroutine started by startReaperLocked. Both are nil before the
+	// reaper starts and again after Shutdown stops it. They are guarded by mu,
+	// which makes starting during a concurrent Shutdown impossible: addToGroup
+	// only starts it after checking stopped under the same lock.
+	reaperStop chan struct{}
+	reaperDone chan struct{}
 }
 
 type logGroup struct {
 	key string
+	// mapKey is the fully scoped key used in the groups map (the extracted key
+	// plus any group_by_resource_attributes components). It is kept so the LRU
+	// list can evict a group without a map scan.
+	mapKey string
 	// resource is a deep copy of the source resource attributes of the first
 	// record in the group, taken while the upstream pdata is still valid. It is
 	// copied onto the emitted trace's resource when copy_resource_attributes is
 	// enabled.
 	resource    pcommon.Map
 	records     []*logRecord
-	timer       *time.Timer
-	maxTimer    *time.Timer
 	prevTraceID pcommon.TraceID
 	prevSpanID  pcommon.SpanID
 	traceID     pcommon.TraceID
 	lastSpanID  pcommon.SpanID
+	// elem is this group's node in the connector LRU list.
+	elem *list.Element
+	// firstAdded is when the group (or its post-split replacement) first
+	// received a record. It caps the group's absolute lifetime at max_wait.
+	firstAdded time.Time
 	// lastUpdated is the time the most recent record was added. It drives the
-	// least-recently-updated eviction when max_groups is reached.
+	// inactivity timeout and, by recency order, max_groups eviction.
 	lastUpdated time.Time
-	// flushed guards against a group being emitted twice. time.Timer.Stop()
-	// returns false when the callback has already fired and is queued, so a
-	// stale callback can still run after the group has left the map. It also
-	// stops that callback evicting the replacement group under the same key.
+	// flushed guards against a group being emitted twice. A group is stamped
+	// flushed while still under the connector mutex, before it leaves the map.
+	// It stops a reaper that collected the group and a manual flushGroup racing
+	// on the same pointer from emitting it twice.
 	flushed bool
 }
 
@@ -85,16 +106,36 @@ func (c *logsToSpansConnector) activeGroupCount() int64 {
 	return int64(len(c.groups))
 }
 
-func (*logsToSpansConnector) Start(_ context.Context, _ component.Host) error {
+func (c *logsToSpansConnector) Start(_ context.Context, _ component.Host) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		return nil
+	}
+	c.startReaperLocked()
 	return nil
 }
 
 func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
 	for i := 0; i < ld.ResourceLogs().Len(); i++ {
 		rl := ld.ResourceLogs().At(i)
+		resource := rl.Resource().Attributes()
+		// The resource is deep-copied at most once per ResourceLogs, outside the
+		// connector mutex, and only if this batch actually has groupable records.
+		// A group created below takes ownership of the copy; a group that already
+		// exists ignores it. Either way no pdata copy happens under the mutex.
+		var resourceCopy pcommon.Map
+		resourceCopied := false
+
 		for j := 0; j < rl.ScopeLogs().Len(); j++ {
 			sl := rl.ScopeLogs().At(j)
-			resource := rl.Resource().Attributes()
+			// Group the batch's records by extracted key so the connector mutex
+			// is taken once per group per batch instead of once per record. A
+			// single-key stream therefore does one small lock acquisition per
+			// ConsumeLogs call rather than one per log. order is capped so a
+			// huge single-key scope does not preallocate a huge key slice.
+			batches := make(map[string][]*logRecord)
+			order := make([]string, 0, min(sl.LogRecords().Len(), 16))
 			for k := 0; k < sl.LogRecords().Len(); k++ {
 				lr := sl.LogRecords().At(k)
 				c.telemetry.ConnectorLogsToSpansLogsIngested.Add(ctx, 1)
@@ -107,13 +148,27 @@ func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) er
 				// Extract the record before taking the lock. The body/severity
 				// conversion is the dominant per-record cost (for a Map body
 				// valueToString serializes it to JSON while it runs), and running it
-				// inside c.mu serialized every core against all groups and timer
-				// callbacks. The result is an immutable copy, so addToGroup only does
-				// map/list work under the lock. Extraction must stay eager: plog values
-				// are views into upstream-owned pdata and must not be retained past
-				// ConsumeLogs (the connector declares MutatesData: false).
+				// inside c.mu serialized every core against all groups and the
+				// reaper. The result is an immutable copy, so the batch append only
+				// does map/list work under the lock. Extraction must stay eager: plog
+				// values are views into upstream-owned pdata and must not be retained
+				// past ConsumeLogs (the connector declares MutatesData: false).
 				rec := extractLogRecord(lr, c.config)
-				c.addToGroup(key, resource, rec)
+				if _, seen := batches[key]; !seen {
+					order = append(order, key)
+				}
+				batches[key] = append(batches[key], rec)
+			}
+
+			if len(order) == 0 {
+				continue
+			}
+			if !resourceCopied {
+				resourceCopy = copyResourceAttributes(resource)
+				resourceCopied = true
+			}
+			for _, key := range order {
+				c.addRecords(key, resource, resourceCopy, batches[key])
 			}
 		}
 	}
@@ -123,23 +178,27 @@ func (c *logsToSpansConnector) ConsumeLogs(ctx context.Context, ld plog.Logs) er
 func (c *logsToSpansConnector) Shutdown(ctx context.Context) error {
 	c.mu.Lock()
 	c.stopped = true
-	c.mu.Unlock()
+	stop := c.reaperStop
+	done := c.reaperDone
+	c.reaperStop = nil
+	c.reaperDone = nil
 
-	c.mu.Lock()
-	for _, g := range c.groups {
-		if g.timer != nil {
-			g.timer.Stop()
-		}
-		if g.maxTimer != nil {
-			g.maxTimer.Stop()
-		}
-	}
 	groups := make([]*logGroup, 0, len(c.groups))
 	for _, g := range c.groups {
+		g.flushed = true
 		groups = append(groups, g)
 	}
 	c.groups = make(map[string]*logGroup)
+	c.lru.Init()
 	c.mu.Unlock()
+
+	// Stop the reaper before flushing what is left, so no group can be emitted
+	// twice and no goroutine survives Shutdown. The wait is outside the mutex:
+	// a reaper mid-scan may still hold it.
+	if stop != nil {
+		close(stop)
+		<-done
+	}
 
 	for _, g := range groups {
 		c.processGroup(ctx, g)
@@ -151,128 +210,223 @@ func (c *logsToSpansConnector) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// addToGroup buffers a single record. It is the entry point the tests drive;
+// the hot path is ConsumeLogs, which batches a group's records into one call to
+// addRecords. See addRecords for what actually runs under c.mu.
 func (c *logsToSpansConnector) addToGroup(key string, resource pcommon.Map, rec *logRecord) {
-	c.mu.Lock()
+	c.addRecords(key, resource, copyResourceAttributes(resource), []*logRecord{rec})
+}
 
+// addRecords buffers every record in recs under one acquisition of c.mu. recs
+// all share the extracted key and resource, and are appended in order. The
+// resource copy is supplied by the caller (ConsumeLogs copies it once per
+// ResourceLogs) so what runs under the lock is deliberately small:
+//
+//   - the scoped map key is built before the lock, so the resource attribute
+//     walk (and any JSON serialization of a Map-valued attribute) is parallel;
+//   - a new group takes the caller's resource copy, so no pdata copy runs under
+//     the mutex;
+//   - max_groups eviction is O(1) off the LRU list, not an O(groups) scan;
+//   - there are no per-group timers at all: the single reaper goroutine owns
+//     every deadline, so only the map/list splice, the per-group append and a
+//     rare max_logs_per_trace split remain.
+func (c *logsToSpansConnector) addRecords(key string, resource, resourceCopy pcommon.Map, recs []*logRecord) {
+	if len(recs) == 0 {
+		return
+	}
+	mapKey := c.buildMapKey(key, resource)
+	now := time.Now()
+
+	c.mu.Lock()
 	if c.stopped {
 		c.mu.Unlock()
 		return
 	}
-
-	// The map key is the extracted key, optionally extended with the configured
-	// resource attribute values, so the same key from different sources lands in
-	// different groups. The extracted key is kept separately for the group.key
-	// span attribute and for logging.
-	mapKey := c.buildMapKey(key, resource)
+	c.startReaperLocked()
 
 	group, exists := c.groups[mapKey]
 	var evicted *logGroup
 	if !exists {
-		// Bound the number of live groups. A high-cardinality key (a request or
-		// connection ID, a raw trace ID) otherwise creates one map entry and two
-		// live timers per distinct value until the timeout fires.
+		// Bound the number of live groups. The LRU list makes this O(1): a
+		// high-cardinality key (a request or connection ID, a raw trace ID)
+		// otherwise grows the map without bound until the timeout fires.
 		if c.config.MaxGroups > 0 && len(c.groups) >= c.config.MaxGroups {
-			evicted = c.evictLeastRecentlyUpdatedLocked()
+			evicted = c.evictLeastRecentlyUsedLocked()
 		}
-		group = &logGroup{key: key, resource: copyResourceAttributes(resource)}
+		group = &logGroup{key: key, mapKey: mapKey, resource: resourceCopy, firstAdded: now, lastUpdated: now}
+		group.elem = c.lru.PushFront(group)
 		c.groups[mapKey] = group
-		group.maxTimer = time.AfterFunc(c.config.MaxWait, func() {
-			c.flushGroup(mapKey, group)
-		})
 	}
 
-	group.lastUpdated = time.Now()
-	group.records = append(group.records, rec)
-
-	if group.timer != nil {
-		group.timer.Stop()
-	}
-	group.timer = time.AfterFunc(c.config.Timeout, func() {
-		c.flushGroup(mapKey, group)
-	})
-
-	if c.config.MaxLogsPerTrace > 0 && len(group.records) >= c.config.MaxLogsPerTrace {
-		traceID := generateTraceID()
-		lastSpanID := generateSpanID()
-		flushedRecords := group.records
-		flushedPrevTraceID := group.prevTraceID
-		flushedPrevSpanID := group.prevSpanID
-
-		// Retire the outgoing group before it leaves the map. Its timers may
-		// already have fired and queued a callback, and Stop() returning false
-		// is not enough on its own: mark the group flushed so a queued callback
-		// becomes a no-op instead of re-emitting these records or deleting the
-		// replacement group installed below.
-		group.flushed = true
-		if group.maxTimer != nil {
-			group.maxTimer.Stop()
+	var flushed []*logGroup
+	for _, rec := range recs {
+		if full := c.addRecordLocked(mapKey, group, rec, now); full != nil {
+			flushed = append(flushed, full)
+			// A max_logs_per_trace split installed a linked replacement under
+			// the same key; the rest of the batch goes into it.
+			group = c.groups[mapKey]
 		}
-		if group.timer != nil {
-			group.timer.Stop()
-		}
-		delete(c.groups, mapKey)
-		group.records = nil
-
-		// The replacement inherits the group's resource: a split must not change
-		// the resource of the records that follow.
-		newGroup := &logGroup{key: key, resource: group.resource}
-		newGroup.lastUpdated = time.Now()
-		newGroup.prevTraceID = traceID
-		newGroup.prevSpanID = lastSpanID
-		c.groups[mapKey] = newGroup
-		newGroup.maxTimer = time.AfterFunc(c.config.MaxWait, func() {
-			c.flushGroup(mapKey, newGroup)
-		})
-		newGroup.timer = time.AfterFunc(c.config.Timeout, func() {
-			c.flushGroup(mapKey, newGroup)
-		})
-		c.mu.Unlock()
-		c.processGroup(context.Background(), &logGroup{
-			key:         key,
-			resource:    group.resource,
-			records:     flushedRecords,
-			prevTraceID: flushedPrevTraceID,
-			prevSpanID:  flushedPrevSpanID,
-			traceID:     traceID,
-			lastSpanID:  lastSpanID,
-		})
-		c.emitEvictedGroup(evicted)
-		return
 	}
-
 	c.mu.Unlock()
+
+	for _, full := range flushed {
+		c.processGroup(context.Background(), full)
+	}
 	c.emitEvictedGroup(evicted)
 }
 
-// evictLeastRecentlyUpdatedLocked removes and returns the group with the
-// oldest lastUpdated time so a new group can take its place. The caller must
-// hold c.mu. Ties are broken by key, which keeps eviction deterministic when
-// two groups were updated in the same clock tick.
-func (c *logsToSpansConnector) evictLeastRecentlyUpdatedLocked() *logGroup {
-	var victimKey string
-	var victim *logGroup
-	for key, group := range c.groups {
-		if victim == nil || group.lastUpdated.Before(victim.lastUpdated) ||
-			(group.lastUpdated.Equal(victim.lastUpdated) && key < victimKey) {
-			victimKey, victim = key, group
-		}
+// addRecordLocked appends rec to group, stamps its recency and keeps the LRU
+// order. When the group reaches max_logs_per_trace it is retired and replaced
+// in place, and the retired group is returned for the caller to emit after it
+// releases c.mu. The caller must hold c.mu.
+func (c *logsToSpansConnector) addRecordLocked(mapKey string, group *logGroup, rec *logRecord, now time.Time) *logGroup {
+	group.lastUpdated = now
+	group.records = append(group.records, rec)
+	if group.elem != nil {
+		c.lru.MoveToFront(group.elem)
 	}
-	if victim == nil {
+
+	if c.config.MaxLogsPerTrace <= 0 || len(group.records) < c.config.MaxLogsPerTrace {
 		return nil
 	}
 
+	traceID := generateTraceID()
+	lastSpanID := generateSpanID()
+
+	// Stamp the outgoing group flushed before it leaves the map. Nothing else
+	// can emit it now: the reaper checks flushed under the same lock, and
+	// flushGroup checks it too.
+	group.flushed = true
+	delete(c.groups, mapKey)
+	if group.elem != nil {
+		c.lru.Remove(group.elem)
+		group.elem = nil
+	}
+	// The retired group becomes the emitted trace, so it owns the ids the next
+	// group links back to.
+	group.traceID = traceID
+	group.lastSpanID = lastSpanID
+
+	// The replacement inherits the group's resource: a split must not change
+	// the resource of the records that follow. Its max_wait restarts here, as
+	// the previous per-group timer did.
+	replacement := &logGroup{
+		key:         group.key,
+		mapKey:      mapKey,
+		resource:    group.resource,
+		prevTraceID: traceID,
+		prevSpanID:  lastSpanID,
+		firstAdded:  now,
+		lastUpdated: now,
+	}
+	replacement.elem = c.lru.PushFront(replacement)
+	c.groups[mapKey] = replacement
+
+	return group
+}
+
+// startReaperLocked starts the single reaper goroutine if it is not already
+// running. The caller must hold c.mu and must have checked !c.stopped, so a
+// concurrent Shutdown cannot set stopped and miss the goroutine. It is called
+// from Start for the collector lifecycle and from the first addToGroup so
+// embedders and tests that skip Start still get timeout flushing.
+func (c *logsToSpansConnector) startReaperLocked() {
+	if c.reaperStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	c.reaperStop = stop
+	c.reaperDone = done
+	go c.reapLoop(stop, done)
+}
+
+// reapLoop is the connector's only timing goroutine. One tick scans for expired
+// groups instead of two time.AfterFunc allocations per log record, which is
+// what kept the per-record path inside a mutex. Shutdown closes stop and waits
+// for done, so it never outlives the connector (the package runs under goleak).
+func (c *logsToSpansConnector) reapLoop(stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(c.reapInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			c.reapExpired()
+		}
+	}
+}
+
+// reapInterval picks the reaper's tick. It is a quarter of the shorter of
+// timeout and max_wait, clamped to [10ms, 1s]: fine enough that a short timeout
+// is honored promptly, coarse enough that the scan is negligible against the
+// default five-second timeout. A group can therefore be flushed up to one tick
+// after its deadline; max_wait still caps a group's absolute lifetime.
+func (c *logsToSpansConnector) reapInterval() time.Duration {
+	interval := c.config.Timeout
+	interval = min(interval, c.config.MaxWait)
+	interval /= 4
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	if interval > time.Second {
+		interval = time.Second
+	}
+	return interval
+}
+
+// reapExpired flushes every group past its inactivity timeout or its absolute
+// max_wait. The O(groups) scan runs on the reaper goroutine, not on the
+// per-record path; each collected group is emitted after the lock is released.
+func (c *logsToSpansConnector) reapExpired() {
+	now := time.Now()
+
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		return
+	}
+	var expired []*logGroup
+	for key, group := range c.groups {
+		if now.Sub(group.lastUpdated) < c.config.Timeout && now.Sub(group.firstAdded) < c.config.MaxWait {
+			continue
+		}
+		group.flushed = true
+		delete(c.groups, key)
+		if group.elem != nil {
+			c.lru.Remove(group.elem)
+			group.elem = nil
+		}
+		expired = append(expired, group)
+	}
+	c.mu.Unlock()
+
+	for _, group := range expired {
+		c.processGroup(context.Background(), group)
+	}
+}
+
+// evictLeastRecentlyUsedLocked removes and returns the least recently updated
+// group so a new group can take its place. The caller must hold c.mu. It reads
+// the tail of the LRU list, so it is O(1); the list is kept in recency order by
+// addRecordLocked and the replacement installed by a max_logs_per_trace split.
+func (c *logsToSpansConnector) evictLeastRecentlyUsedLocked() *logGroup {
+	elem := c.lru.Back()
+	if elem == nil {
+		return nil
+	}
+	victim := elem.Value.(*logGroup)
+
 	// Retire the victim before it leaves the map, exactly as the
-	// max_logs_per_trace split does: an already-queued timer callback must
-	// find the group flushed instead of re-emitting it or deleting a
-	// replacement.
+	// max_logs_per_trace split does: the reaper and flushGroup both check
+	// flushed under this lock, so it cannot be emitted twice.
 	victim.flushed = true
-	if victim.timer != nil {
-		victim.timer.Stop()
-	}
-	if victim.maxTimer != nil {
-		victim.maxTimer.Stop()
-	}
-	delete(c.groups, victimKey)
+	c.lru.Remove(elem)
+	victim.elem = nil
+	delete(c.groups, victim.mapKey)
 	return victim
 }
 
@@ -293,6 +447,10 @@ func (c *logsToSpansConnector) emitEvictedGroup(group *logGroup) {
 	c.processGroup(context.Background(), group)
 }
 
+// flushGroup retires a group by key and emits it unless it has already been
+// flushed. The reaper no longer needs it (it collects expired groups itself),
+// but it remains the single, lock-guarded retire path the tests drive to prove
+// an already-flushed group is never emitted twice.
 func (c *logsToSpansConnector) flushGroup(key string, group *logGroup) {
 	c.mu.Lock()
 	if c.stopped || group.flushed {
@@ -301,20 +459,14 @@ func (c *logsToSpansConnector) flushGroup(key string, group *logGroup) {
 	}
 	group.flushed = true
 
-	// Stop this group's own timers before touching the map. Both timer and
-	// maxTimer point at this group, so whichever fires second must find it
-	// already flushed and do nothing.
-	if group.maxTimer != nil {
-		group.maxTimer.Stop()
-	}
-	if group.timer != nil {
-		group.timer.Stop()
-	}
-
-	// Only the group that still owns the key may evict it. A callback from a
-	// group replaced by max_logs_per_trace must not delete the replacement.
+	// Only the group that still owns the key may leave the map. A group
+	// replaced by max_logs_per_trace must not delete the replacement.
 	if current, ok := c.groups[key]; ok && current == group {
 		delete(c.groups, key)
+		if group.elem != nil {
+			c.lru.Remove(group.elem)
+			group.elem = nil
+		}
 	}
 	c.mu.Unlock()
 	c.processGroup(context.Background(), group)

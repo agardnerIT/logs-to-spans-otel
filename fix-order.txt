@@ -618,6 +618,78 @@ PHASE 5 - DONATION
     the project-structure tree, and an Unreleased Changelog line.
 
 
+[14] #20  DONE - issue closed. Commit pending.
+         Remove the remaining per-record work from the connector mutex
+         (timer churn, resource copy, O(n) eviction)
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/20
+
+    The last code-side follow-up to #15. #15 moved body/severity extraction
+    out of c.mu; this removed everything else that still ran inside it.
+
+    What landed in connector.go:
+
+      - Single reaper goroutine. Every per-group time.AfterFunc is gone. One
+        goroutine ticks at a quarter of the shorter of timeout/max_wait,
+        clamped to [10ms, 1s], scans the groups, and flushes those past either
+        deadline outside the lock. Two timer create/stop operations per record
+        are no longer in the critical section at all. Flush precision is now
+        bounded by one tick; timeout and max_wait semantics are otherwise
+        unchanged and documented in the README.
+      - startReaperLocked is called from Start and from the first addToGroup,
+        both under c.mu after a stopped check, so a concurrent Shutdown cannot
+        strand it. Shutdown closes stop and waits for done before flushing what
+        is left, so the goroutine never outlives the connector (goleak).
+      - No resource copy under the lock. addRecords takes a resource copy the
+        caller made; ConsumeLogs deep-copies at most once per ResourceLogs,
+        outside the lock, in case the batch opens a new group.
+      - O(1) max_groups eviction. groups gained an LRU list (container/list);
+        addRecordLocked moves a group to the front, evictLeastRecentlyUsedLocked
+        pops the tail. The old O(max_groups) scan is gone. The tie-break-by-key
+        test was replaced: recency order is now the deterministic victim.
+      - Batching. ConsumeLogs groups a scope's records by extracted key and
+        calls addRecords once per group, so the lock is taken once per group per
+        ConsumeLogs call rather than once per record. A single-key stream does
+        one small acquisition per batch. addToGroup (single record) remains as
+        the tests' entry point and delegates to addRecords.
+      - max_logs_per_trace split: the outgoing group is retired under the lock
+        and the linked replacement is installed under the same key; the retired
+        group is emitted after the lock is released. The split keeps reusing the
+        flushed-flag discipline from #7.
+
+    Benchmark (8-core Apple M2, go1.26.4, nop traces consumer, -benchtime=3s):
+
+      benchmark                                   before #20   after #20
+      ConsumeLogsStructured (single, grouping)    ~415k/s      ~495k/s
+      ConsumeLogsStructuredParallel (grouping)    ~563k/s      ~1.5M/s
+      ConsumeLogsStructuredParallelSplits*        ~555k/s      ~735k/s
+
+      * the Splits benchmark is the same parallel workload with
+        max_logs_per_trace: 1000 (the shape #15 used). Its cost is dominated by
+        building and emitting a trace at each split (pdata allocations plus a
+        crypto/rand span ID per span), so its 8-core number is GC-bound, not
+        lock-bound. The grouping benchmark disables the cap so it measures the
+        path #20 changed; on it the parallel case is ~3x the single-caller
+        number. A fresh -mutexprofile shows addToGroup/addRecords at ~5% of
+        contention delay (runtime GC/scheduler locks dominate), down from ~92%
+        before; CPU utilisation rose from ~357% to ~515%.
+
+    Tests: new TestConsumeLogsBatchesRecordsByGroupKey (interleaved keys in one
+    ConsumeLogs call still form separate, ordered groups). Existing timeout,
+    max_wait, eviction, split, stale-callback and concurrency tests now drive
+    the reaper and all pass. createTestConnector/createMetricsTestConnector
+    Start the connector and register a t.Cleanup Shutdown, so the reaper is
+    stopped for tests that assert without shutting down explicitly.
+
+    Verified: gofmt clean, go vet ./..., golangci-lint run ./... clean at
+    v2.13.2, and go test -race -count=1 ./... (all three packages, goleak
+    included). No config surface change, so no schemagen/metadata change; OCB
+    build of the working tree is unaffected by an internal-only refactor.
+
+    README: timeout/max_wait now document reaper granularity, the max_groups
+    section no longer claims a linear scan or key tie-break, the benchmark and
+    test lists are updated, and an Unreleased Changelog entry was added.
+
+
 IF YOU WANT TO MOVE FAST
 ========================
 
@@ -638,8 +710,8 @@ deferred - it is the one a reviewer will raise on the first pass.
 
 Issues filed since this work order was written: #19 (golangci-lint in CI) is
 done (see [13]); #18 (CI built the published tag) is done (see [1b]); #20
-(remove the remaining per-record work from the connector mutex) is still open
-and is the only known code-side follow-up.
+(remove the remaining per-record work from the connector mutex) is done (see
+[14]). Nothing in the original issue list is outstanding on the code side.
 
 
 DOCUMENTATION - EVERY SESSION, NO EXCEPTIONS

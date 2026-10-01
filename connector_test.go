@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/connector"
 	"go.opentelemetry.io/collector/connector/connectortest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
@@ -39,6 +40,12 @@ func createTestConnector(t *testing.T, cfg *Config, sink *consumertest.TracesSin
 	factory := NewFactory()
 	conn, err := factory.CreateLogsToTraces(t.Context(), newTestSettings(), cfg, sink)
 	require.NoError(t, err)
+	// Start so the timeout/max_wait reaper runs, matching the collector
+	// lifecycle. Shutdown in the test stops it, keeping goleak clean. The
+	// cleanup is the net for tests that assert without an explicit Shutdown;
+	// calling Shutdown twice is a no-op.
+	require.NoError(t, conn.Start(t.Context(), componenttest.NewNopHost()))
+	t.Cleanup(func() { require.NoError(t, conn.Shutdown(t.Context())) })
 	return conn
 }
 
@@ -1634,9 +1641,11 @@ func TestMaxGroupsEvictsLeastRecentlyUpdated(t *testing.T) {
 	assert.Equal(t, 1, sink.AllTraces()[0].SpanCount())
 }
 
-// With equal lastUpdated timestamps eviction must still be deterministic,
-// otherwise a high-cardinality stream could evict an arbitrary group.
-func TestMaxGroupsEvictionTieBreaksByKey(t *testing.T) {
+// With equal lastUpdated timestamps eviction still has a deterministic victim:
+// eviction follows the connector's LRU order, so the group that was added (or
+// last updated) first goes first. A high-cardinality stream therefore evicts
+// predictably rather than an arbitrary group.
+func TestMaxGroupsEvictionFollowsLRUOrder(t *testing.T) {
 	sink := newTestSink()
 	cfg := createDefaultConfig()
 	cfg.Timeout = 10 * time.Second
@@ -1650,6 +1659,8 @@ func TestMaxGroupsEvictionTieBreaksByKey(t *testing.T) {
 	addTestRecord(c, "b", newLogRecord("user=b one", now, "INFO"))
 	addTestRecord(c, "a", newLogRecord("user=a one", now, "INFO"))
 
+	// Flatten the clock so recency cannot distinguish the two: the LRU list
+	// order is the only signal left.
 	c.mu.Lock()
 	c.groups["a"].lastUpdated = now
 	c.groups["b"].lastUpdated = now
@@ -1662,8 +1673,8 @@ func TestMaxGroupsEvictionTieBreaksByKey(t *testing.T) {
 	_, hasB := c.groups["b"]
 	c.mu.Unlock()
 
-	assert.False(t, hasA, "ties are broken by key, so a goes first")
-	assert.True(t, hasB)
+	assert.False(t, hasB, "b was touched first and is therefore least recently used")
+	assert.True(t, hasA)
 }
 
 // A cap of one forces an eviction on every subsequent distinct key. Every
@@ -1713,6 +1724,47 @@ func TestMaxGroupsZeroMeansUnlimited(t *testing.T) {
 
 	assert.Equal(t, 50, got, "max_groups: 0 must disable the cap")
 	assert.Empty(t, sink.AllTraces(), "nothing may be evicted with the cap disabled")
+}
+
+// ConsumeLogs groups a whole batch's records by key and takes the connector
+// mutex once per group. This pins the observable contract of that batching:
+// interleaved records for different keys still form separate groups, and each
+// group keeps the order the records arrived in.
+func TestConsumeLogsBatchesRecordsByGroupKey(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	base := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogs(t, conn, []plog.LogRecord{
+		newLogRecord("user=aaa first", base, "INFO"),
+		newLogRecord("user=bbb first", base, "INFO"),
+		newLogRecord("user=aaa second", base.Add(time.Second), "INFO"),
+		newLogRecord("user=bbb second", base.Add(time.Second), "INFO"),
+		newLogRecord("user=aaa third", base.Add(2*time.Second), "INFO"),
+	})
+	require.NoError(t, conn.Shutdown(t.Context()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 2, "one trace per distinct key")
+
+	bodiesByKey := map[string][]string{}
+	for _, td := range traces {
+		ss := td.ResourceSpans().At(0).ScopeSpans().At(0)
+		key, _ := ss.Spans().At(0).Attributes().Get("group.key")
+		bodies := make([]string, ss.Spans().Len())
+		for i := range bodies {
+			b, _ := ss.Spans().At(i).Attributes().Get("log.body")
+			bodies[i] = b.Str()
+		}
+		bodiesByKey[key.Str()] = bodies
+	}
+
+	assert.Equal(t, []string{"user=aaa first", "user=aaa second", "user=aaa third"}, bodiesByKey["aaa"])
+	assert.Equal(t, []string{"user=bbb first", "user=bbb second"}, bodiesByKey["bbb"])
 }
 
 // The cap applies to opening a new group, not to adding records to a group

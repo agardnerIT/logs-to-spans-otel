@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -45,16 +46,28 @@ func newStructuredBenchmarkLogs(n int) plog.Logs {
 	return ld
 }
 
-func newBenchmarkConnector(b *testing.B) *logsToSpansConnector {
+// newBenchmarkConnector builds a connector for the benchmarks. maxLogsPerTrace
+// controls whether the measurement includes max_logs_per_trace split handling:
+//
+//   - 0 disables the cap, so the benchmark measures the steady-state per-record
+//     grouping path (extraction plus the group-map splice inside the connector
+//     mutex) with no trace construction. That is the path issue #20 is about.
+//   - a positive value makes the group emit a trace and start a linked
+//     replacement at the cap. Building that trace allocates pdata, sorts the
+//     batch and draws a crypto/rand span ID per span, which dominates the
+//     allocation profile and caps 8-core scaling on GC rather than on the
+//     connector lock. BenchmarkConsumeLogsStructuredParallelSplits keeps a
+//     measurement of that combined shape.
+//
+// Timeout and max_wait are an hour either way so the reaper never fires
+// mid-measurement.
+func newBenchmarkConnector(b *testing.B, maxLogsPerTrace int) *logsToSpansConnector {
 	b.Helper()
 	cfg := createDefaultConfig()
 	cfg.GroupByKeys = []string{"user"}
-	// Keep the groups bounded and stop the timers firing mid-benchmark, so the
-	// measurement is the steady-state per-record path rather than unbounded
-	// growth or a timer flush.
 	cfg.Timeout = time.Hour
 	cfg.MaxWait = time.Hour
-	cfg.MaxLogsPerTrace = 1000
+	cfg.MaxLogsPerTrace = maxLogsPerTrace
 
 	factory := NewFactory()
 	// A nop traces consumer, not a recording sink: consumertest.TracesSink takes
@@ -62,15 +75,31 @@ func newBenchmarkConnector(b *testing.B) *logsToSpansConnector {
 	// the connector's own lock does.
 	conn, err := factory.CreateLogsToTraces(b.Context(), newTestSettings(), cfg, consumertest.NewNop())
 	require.NoError(b, err)
+	require.NoError(b, conn.Start(b.Context(), componenttest.NewNopHost()))
 	return conn.(*logsToSpansConnector)
 }
 
+// drainBenchmarkGroups drops any buffered records before Shutdown. The
+// cap-disabled benchmarks accumulate every record in one group; without this
+// Shutdown would construct one enormous trace at cleanup. It runs after the
+// measurement, so it cannot affect the reported numbers.
+func drainBenchmarkGroups(conn *logsToSpansConnector) {
+	conn.mu.Lock()
+	conn.groups = make(map[string]*logGroup)
+	conn.lru.Init()
+	conn.mu.Unlock()
+}
+
 // BenchmarkConsumeLogsStructured measures single-goroutine throughput on a Map
-// body. It is the baseline: with one caller the mutex is uncontended, so it
-// mostly shows the extraction cost itself.
+// body with the grouping path isolated. It is the baseline for the parallel
+// benchmark: with one caller the mutex is uncontended, so it mostly shows the
+// extraction cost itself.
 func BenchmarkConsumeLogsStructured(b *testing.B) {
-	conn := newBenchmarkConnector(b)
-	defer func() { require.NoError(b, conn.Shutdown(b.Context())) }()
+	conn := newBenchmarkConnector(b, 0)
+	defer func() {
+		drainBenchmarkGroups(conn)
+		require.NoError(b, conn.Shutdown(b.Context()))
+	}()
 
 	ld := newStructuredBenchmarkLogs(benchBatchSize)
 	ctx := b.Context()
@@ -84,14 +113,45 @@ func BenchmarkConsumeLogsStructured(b *testing.B) {
 }
 
 // BenchmarkConsumeLogsStructuredParallel runs concurrent ConsumeLogs callers
-// against one connector. Before issue #15 this is where the global mutex bit:
-// the map-body JSON conversion ran inside the critical section shared by all
-// groups and timer callbacks, serializing every core. After the fix only the
-// map/list splice stays under the lock, so this case now runs faster than the
-// single-goroutine baseline instead of slower. It does not scale linearly:
-// timer Stop + AfterFunc per record is still serialized by the lock.
+// against one connector, with the max_logs_per_trace cap disabled so the
+// measurement is the group-map path alone. Before issue #15 the map-body JSON
+// conversion ran inside the global mutex and serialized every core; after #15
+// that cost moved out but a time.AfterFunc Stop+reset per record kept the lock
+// hot. #20 removed the timers entirely (a single reaper owns every deadline),
+// made max_groups eviction O(1) off an LRU list and batches a whole group's
+// records into one lock acquisition per ConsumeLogs call, so this case now
+// scales with the cores instead of sitting just above the single-caller number.
 func BenchmarkConsumeLogsStructuredParallel(b *testing.B) {
-	conn := newBenchmarkConnector(b)
+	conn := newBenchmarkConnector(b, 0)
+	defer func() {
+		drainBenchmarkGroups(conn)
+		require.NoError(b, conn.Shutdown(b.Context()))
+	}()
+
+	ld := newStructuredBenchmarkLogs(benchBatchSize)
+	ctx := b.Context()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := conn.ConsumeLogs(ctx, ld); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+	b.ReportMetric(float64(b.N*benchBatchSize)/b.Elapsed().Seconds(), "logs/sec")
+}
+
+// BenchmarkConsumeLogsStructuredParallelSplits is the same parallel workload
+// with max_logs_per_trace at 1000, the shape used before #20. Each split now
+// builds and emits a trace, and that path (not the connector lock) dominates:
+// it allocates pdata per span and draws a crypto/rand span ID per span, so the
+// 8-core number is GC-bound. It is kept to show that turning the cap on does
+// not regress and to make the allocation boundary explicit.
+func BenchmarkConsumeLogsStructuredParallelSplits(b *testing.B) {
+	conn := newBenchmarkConnector(b, 1000)
 	defer func() { require.NoError(b, conn.Shutdown(b.Context())) }()
 
 	ld := newStructuredBenchmarkLogs(benchBatchSize)

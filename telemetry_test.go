@@ -45,6 +45,11 @@ func createMetricsTestConnector(
 	settings, reader := newMetricsTestSettings(t)
 	conn, err := NewFactory().CreateLogsToTraces(t.Context(), settings, cfg, sink)
 	require.NoError(t, err)
+	// Start so the timeout/max_wait reaper runs, matching the collector
+	// lifecycle. The tests that rely on a timeout flush need it; the cleanup
+	// stops it for the ones that do not shut down explicitly.
+	require.NoError(t, conn.Start(t.Context(), componenttest.NewNopHost()))
+	t.Cleanup(func() { require.NoError(t, conn.Shutdown(t.Context())) })
 	return conn, reader
 }
 
