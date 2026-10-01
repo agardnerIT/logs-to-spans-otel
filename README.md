@@ -25,7 +25,7 @@
 
 **Convert log records into trace spans** by grouping logs that share a common attribute value (e.g. `userID=123`). Each group becomes a single trace, with every log ordered by timestamp becoming a span in that trace.
 
-> **This connector is not included in any official OpenTelemetry Collector distribution.** You must build your own custom Collector using the [OpenTelemetry Collector Builder (OCB)](https://opentelemetry.io/docs/collector/extend/ocb/). The builder binary is available as a downloadable asset from [OpenTelemetry Collector releases](https://github.com/open-telemetry/opentelemetry-collector-releases/tags) (look for `cmd/builder` tags). Docker images can be built using the [Dockerfile](#containerize-your-collector-distribution) example below. A ready-to-use [`builder-config.yaml`](builder-config.yaml) is included in this repo.
+> **This connector is not included in any official OpenTelemetry Collector distribution.** You must build your own custom Collector using the [OpenTelemetry Collector Builder (OCB)](https://opentelemetry.io/docs/collector/extend/ocb/). The builder binary is available as a downloadable asset from [OpenTelemetry Collector releases](https://github.com/open-telemetry/opentelemetry-collector-releases/tags) (look for `cmd/builder` tags). A ready-to-use [`builder-config.yaml`](builder-config.yaml) is included in this repo.
 
 ## Why?
 
@@ -383,21 +383,21 @@ connectors:
     name: "logs_to_spans"
 
 exporters:
-  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.154.0"
-  - gomod: "go.opentelemetry.io/collector/exporter/otlpexporter v0.154.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.162.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/otlpexporter v0.162.0"
 
 receivers:
-  - gomod: "go.opentelemetry.io/collector/receiver/otlpreceiver v0.154.0"
-  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.154.0"
+  - gomod: "go.opentelemetry.io/collector/receiver/otlpreceiver v0.162.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.162.0"
 
 processors:
-  - gomod: "go.opentelemetry.io/collector/processor/batchprocessor v0.154.0"
-  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.154.0"
+  - gomod: "go.opentelemetry.io/collector/processor/batchprocessor v0.162.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.162.0"
 
 providers:
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.48.0"
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.48.0"
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.48.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.68.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.68.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.68.0"
 ```
 
 Build:
@@ -406,14 +406,14 @@ Build:
 ocb --config builder-config.yaml
 ```
 
-> **Local development:** if you're testing changes before publishing, add `path: "."` alongside the `gomod` entry to point OCB at your local checkout.
+> **Local development:** to test unpublished changes, point OCB at your local checkout. Paths in a `replaces:` block are resolved relative to `output_path`, so with `output_path: ./otelcol-dist` this repo uses `github.com/agardnerIT/logs-to-spans-otel => ../` (see [`builder-config.yaml`](builder-config.yaml)). Without a local reference OCB builds the published tag and your edits are ignored.
 
 ## Development
 
 ### Prerequisites
 
-- Go 1.25+
-- OpenTelemetry Collector Builder (`ocb`) — available at `~/tools/ocb` or [install from releases](https://github.com/open-telemetry/opentelemetry-collector-releases)
+- Go 1.26+
+- OpenTelemetry Collector Builder (`ocb`) — [install from releases](https://github.com/open-telemetry/opentelemetry-collector-releases) (this repo builds against OCB v0.162.0)
 
 ### Tests
 
@@ -491,6 +491,10 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 ```
 
 ## Changelog
+
+### Unreleased
+
+- Documentation fixes: the "Including in your own collector build" snippet now matches the collector line this repo builds against (`v0.162.0` core and contrib, `v1.68.0` providers), the Go prerequisite is `1.26+`, the local-development note describes the `replaces:` block the repo actually uses, and a dead Dockerfile link was removed.
 
 ### v0.5.0
 
