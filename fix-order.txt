@@ -553,6 +553,19 @@ PHASE 5 - DONATION
 
     Note: coverage is already 93.7%, comfortably above the 80% target.
 
+    Follow-up (donation-readiness, no user-visible change): migrated the
+    hand-rolled test harness to the collector test helpers where they apply.
+    connector_test.go's newTestSettings now returns
+    connectortest.NewNopSettings(metadata.Type) instead of building
+    connector.Settings by hand, and telemetry_test.go's
+    newMetricsTestSettings starts from componenttest.NewNopTelemetrySettings()
+    before overriding MeterProvider with the manual reader. The
+    nil-MeterProvider fallback test keeps constructing a bare settings value
+    on purpose - the helper would hand it a no-op meter and defeat the test.
+    go vet ./... and go test -race -count=1 ./... green; coverage 96.3%.
+    Still deferred to donation: the module/directory move, scope_name, the
+    .chloggen entry, the contrib-tree make targets, and the humans.
+
 
 IF YOU WANT TO MOVE FAST
 ========================

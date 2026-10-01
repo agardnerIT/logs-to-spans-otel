@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/connector"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -27,12 +28,12 @@ func newMetricsTestSettings(t *testing.T) (connector.Settings, *metric.ManualRea
 	mp := metric.NewMeterProvider(metric.WithReader(reader))
 	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
 
+	telemetrySettings := componenttest.NewNopTelemetrySettings()
+	telemetrySettings.MeterProvider = mp
+
 	return connector.Settings{
-		ID: component.MustNewID(TypeStr),
-		TelemetrySettings: component.TelemetrySettings{
-			Logger:        zap.NewNop(),
-			MeterProvider: mp,
-		},
+		ID:                component.MustNewID(TypeStr),
+		TelemetrySettings: telemetrySettings,
 	}, reader
 }
 

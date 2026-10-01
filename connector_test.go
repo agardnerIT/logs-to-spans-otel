@@ -14,26 +14,25 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/connector"
+	"go.opentelemetry.io/collector/connector/connectortest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	"go.uber.org/zap"
+
+	"github.com/agardnerIT/logs-to-spans-otel/internal/metadata"
 )
 
 func newTestSink() *consumertest.TracesSink {
 	return &consumertest.TracesSink{}
 }
 
+// newTestSettings uses the standard connectortest helper so the tests exercise
+// the same nop telemetry settings the collector wiring would hand a component,
+// instead of hand-rolling connector.Settings.
 func newTestSettings() connector.Settings {
-	return connector.Settings{
-		ID: component.MustNewID("logs_to_spans"),
-		TelemetrySettings: component.TelemetrySettings{
-			Logger: zap.NewNop(),
-		},
-	}
+	return connectortest.NewNopSettings(metadata.Type)
 }
 
 func createTestConnector(t *testing.T, cfg *Config, sink *consumertest.TracesSink) connector.Logs {
