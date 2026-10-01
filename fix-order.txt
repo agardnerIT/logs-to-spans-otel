@@ -567,6 +567,57 @@ PHASE 5 - DONATION
     .chloggen entry, the contrib-tree make targets, and the humans.
 
 
+[13] #19  DONE - issue closed. Commit c6efdab.
+         Add golangci-lint to CI (contrib-level linting)
+         https://github.com/agardnerIT/logs-to-spans-otel/issues/19
+
+    Why: contrib's `make lint` runs golangci-lint v2 with ~25 linters, a much
+    stricter gate than `go vet`. Finding that at donation means a red first
+    contrib CI run and a review stalled on mechanical fixes.
+
+    What landed:
+
+      - .golangci.yml aligned with contrib's root config: the same linter set,
+        the depguard/gocritic/gosec/govet/misspell/revive/staticcheck/
+        testifylint/thelper settings, and issues max-* set to 0. Dropped the
+        contrib-tree bits that cannot run here (third_party paths, the
+        per-component exclusion rules, the semconv and AWS-SDK depguard
+        rules); the gci import prefix is this repo's module path until the
+        donation rename.
+      - Pinned to golangci-lint v2.13.2, the version contrib pins in
+        internal/tools/go.mod. CI installs it with `go install`, the same
+        command the README documents, so local and CI use one version.
+      - A separate `lint` CI job so it fails fast and reads on its own.
+      - `go vet` is retained as its own step in the build job. The govet
+        linter subsumes it, but the standalone step is cheaper to read and
+        fails before the OCB build; the README says so.
+
+    Findings fixed (the first run was not clean - 84 issues):
+
+      - usetesting: context.Background() -> t.Context() / b.Context() in the
+        test files, with the context import dropped where it became unused.
+      - gocritic ifElseChain -> switch for the end-time selection.
+      - modernize: slices.Contains in validateAttributeKeys and range-over-int
+        loops in the tests and the benchmark.
+      - errcheck: the five unchecked conn.Shutdown returns in tests.
+      - testifylint: assert.Equal("", x) -> assert.Empty.
+      - revive unused-receiver: dropped the receiver name on Capabilities and
+        Start (unnamed receiver rather than `_`, which receiver-naming rejects).
+      - unparam: spanIDFromHex took a string it was always given as the same
+        constant; the constant is now inlined.
+      - misspell (US locale) and gofumpt formatting.
+
+    Verified: golangci-lint run ./... clean at v2.13.2 (go1.26.4), gofmt
+    clean, go vet ./..., go test -race -count=1 ./... (all three packages),
+    OCB v0.162.0 build of the working tree, and validate --config
+    collector.yaml. CI green on run 36932354106 (Lint 1m18s, build/validate
+    46s). No user-visible behaviour change.
+
+    README: new Development > Lint section with the pinned install/run
+    commands and the go vet decision, a Prerequisites entry, .golangci.yml in
+    the project-structure tree, and an Unreleased Changelog line.
+
+
 IF YOU WANT TO MOVE FAST
 ========================
 
@@ -581,9 +632,14 @@ A credible donation does not need all 13. Ship this set:
     remaining work is the module/directory move at donation plus the
     sponsor/codeowners.
 
-#15 was optional and is now done too, so nothing in the issue list is
+#15 was optional and is now done too, so nothing in the original issue list is
 outstanding on the code side. #11 is deliberately included rather than
 deferred - it is the one a reviewer will raise on the first pass.
+
+Issues filed since this work order was written: #19 (golangci-lint in CI) is
+done (see [13]); #18 (CI built the published tag) is done (see [1b]); #20
+(remove the remaining per-record work from the connector mutex) is still open
+and is the only known code-side follow-up.
 
 
 DOCUMENTATION - EVERY SESSION, NO EXCEPTIONS
