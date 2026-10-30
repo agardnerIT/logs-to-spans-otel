@@ -63,7 +63,7 @@ ocb --config manifest.yaml
 ./otelcol-dist/otelcol-logs-to-spans-quickstart --config collector.yaml
 ```
 
-The collector builds with OCB v0.162.0 and the published `v0.5.0` connector.
+The collector builds with OCB v0.162.0 and the published `v0.6.0` connector.
 To use local connector changes, add a `replaces` entry pointing at this
 repository, as shown in the root [`builder-config.yaml`](../../builder-config.yaml).
 
