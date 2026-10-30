@@ -1767,6 +1767,40 @@ func TestConsumeLogsBatchesRecordsByGroupKey(t *testing.T) {
 	assert.Equal(t, []string{"user=bbb first", "user=bbb second"}, bodiesByKey["bbb"])
 }
 
+// Records that share a timestamp keep the order they arrived in. The connector
+// sorts each group by timestamp, so a non-stable sort would scramble equal ones
+// and reorder a trace's span chain between runs.
+func TestEqualTimestampsKeepArrivalOrder(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.Timeout = 10 * time.Second
+	cfg.MaxWait = 10 * time.Second
+	cfg.GroupByKeys = []string{"user"}
+	conn := createTestConnector(t, cfg, sink)
+
+	// Same timestamp on every record, and no Timestamp set at all, so the
+	// connector's ObservedTimestamp fallback is what it sorts on.
+	same := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	sendLogs(t, conn, []plog.LogRecord{
+		newLogRecord("user=aaa first", same, "INFO"),
+		newLogRecord("user=aaa second", same, "INFO"),
+		newLogRecord("user=aaa third", same, "INFO"),
+	})
+	require.NoError(t, conn.Shutdown(t.Context()))
+
+	traces := sink.AllTraces()
+	require.Len(t, traces, 1)
+	ss := traces[0].ResourceSpans().At(0).ScopeSpans().At(0)
+	require.Equal(t, 3, ss.Spans().Len())
+
+	bodies := make([]string, ss.Spans().Len())
+	for i := range bodies {
+		b, _ := ss.Spans().At(i).Attributes().Get("log.body")
+		bodies[i] = b.Str()
+	}
+	assert.Equal(t, []string{"user=aaa first", "user=aaa second", "user=aaa third"}, bodies)
+}
+
 // The cap applies to opening a new group, not to adding records to a group
 // that already exists. Otherwise a hot key would be split by eviction.
 func TestMaxGroupsAddingToExistingKeyDoesNotEvict(t *testing.T) {

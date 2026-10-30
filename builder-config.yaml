@@ -17,12 +17,21 @@ replaces:
 exporters:
   - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.162.0"
   - gomod: "go.opentelemetry.io/collector/exporter/otlpexporter v0.162.0"
+  # Not used by collector.yaml, but needed so CI can validate
+  # examples/quickstart/collector.yaml (which exports over OTLP/HTTP) with this
+  # distribution instead of building the example manifest a second time.
+  - gomod: "go.opentelemetry.io/collector/exporter/otlphttpexporter v0.162.0"
 
 receivers:
   - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.162.0"
 
 processors:
   - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.162.0"
+  # Not used by collector.yaml, but needed so CI can validate
+  # examples/quickstart/collector.yaml (which rebases log timestamps onto now)
+  # with this distribution instead of building the example manifest a second
+  # time.
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.162.0"
 
 providers:
   - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.68.0"

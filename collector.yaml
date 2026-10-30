@@ -3,14 +3,21 @@ receivers:
     include: [input.log]
     start_at: beginning
     operators:
+      # Most lines in input.log have no timestamp prefix, so the operator is
+      # optional: a line that does not match is kept as-is (send_quiet) instead
+      # of being dropped or logging an error. The prefix is matched only so it
+      # can be removed from the body, never parsed into the record's Timestamp:
+      # input.log's one dated line is days old, so a parsed timestamp would put
+      # that span outside Jaeger's default "Last 1 hour" view and sort it ahead
+      # of the undated lines in its group. With no Timestamp the connector uses
+      # ObservedTimestamp, i.e. when the receiver read the line.
       - type: regex_parser
-        regex: '^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(?P<body>.*)$'
-        # Most lines in input.log have no timestamp prefix. send_quiet keeps
-        # the entry (body unchanged) without logging an error per line.
+        regex: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+(?P<body>.*)$'
         on_error: send_quiet
-        timestamp:
-          parse_from: attributes.ts
-          layout: '%Y-%m-%d %H:%M:%S'
+      - type: move
+        from: attributes.body
+        to: body
+        on_error: send_quiet
 
 connectors:
   logs_to_spans:

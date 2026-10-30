@@ -712,7 +712,11 @@ func (c *logsToSpansConnector) processGroup(ctx context.Context, group *logGroup
 		return
 	}
 
-	sort.Slice(group.records, func(i, j int) bool {
+	// Stable: records that share a timestamp keep the order they arrived in.
+	// Equal timestamps are routine (a receiver stamping a batch with the same
+	// clock tick, or a coarse ObservedTimestamp), and sort.Slice would reorder
+	// them arbitrarily between runs, scrambling a trace's span chain.
+	sort.SliceStable(group.records, func(i, j int) bool {
 		return group.records[i].timestamp.Before(group.records[j].timestamp)
 	})
 

@@ -11,8 +11,14 @@ connectors:
 receivers:
   - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.162.0"
 
+processors:
+  # Rebase app.log's fixed dates onto now, so the spans land inside Jaeger's
+  # default "Last 1 hour" view instead of years in the past.
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.162.0"
+
 exporters:
   - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.162.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/otlphttpexporter v0.162.0"
 
 providers:
   - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.68.0"

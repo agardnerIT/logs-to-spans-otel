@@ -5,18 +5,46 @@ receivers:
     operators:
       # Split every line into a timestamp, a severity and the rest of the body.
       - type: regex_parser
-        regex: '^(?P<ts>\S+) (?P<severity>\w+) (?P<body>.*)$'
+        regex: '^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) (?P<severity>\w+) (?P<body>.*)$'
         timestamp:
           parse_from: attributes.ts
           layout: '%Y-%m-%dT%H:%M:%SZ'
         # Lines that do not match are kept as-is instead of being dropped.
         on_error: send_quiet
+      # Promote the matched remainder to the record body, so the date prefix
+      # does not leak into span names.
+      - type: move
+        from: attributes.body
+        to: body
+        on_error: send_quiet
       # Parse JSON bodies into a map. Plain-text bodies fail here and are kept
       # as strings, so one receiver handles both log formats.
       - type: json_parser
-        parse_from: attributes.body
+        parse_from: body
         parse_to: body
         on_error: send_quiet
+
+processors:
+  # app.log carries fixed dates, so shipping them as-is puts the spans years in
+  # the past, outside the "Last 1 hour" window Jaeger opens with. Rebase the
+  # file's timeline onto now instead: each span keeps its distance from the
+  # anchor, so the waterfall is intact and the trace always lands just before
+  # now. OTTL is what makes this possible — time.Time minus time.Duration is a
+  # time.Time, and Now() is evaluated per record.
+  #
+  # ANCHOR (the Time() call below) must be the first timestamp in app.log, or
+  # anything earlier. Its only job is to turn "how far into the file" into a
+  # duration that is subtracted from Now(); it never needs updating while the
+  # file keeps its dates. Duration("10s") must exceed the file's total span
+  # (7s here) so no span starts in the future, where Jaeger's lookback search
+  # would not return it. Records with no parsed timestamp (log.time_unix_nano
+  # is 0) are left alone: the connector then uses ObservedTimestamp, the moment
+  # the receiver read the line.
+  transform/rebase:
+    log_statements:
+      - context: log
+        statements:
+          - set(log.time, Now() - Duration("10s") - (Time("2026-01-15T10:00:00Z", "%Y-%m-%dT%H:%M:%SZ") - log.time)) where log.time_unix_nano != 0
 
 connectors:
   logs_to_spans:
@@ -27,12 +55,23 @@ connectors:
 exporters:
   debug:
     verbosity: detailed
+  # OTLP over HTTP/protobuf (component type otlp_http, older name otlphttp).
+  # Jaeger's OTLP/HTTP endpoint is 4318. When the collector runs in Docker,
+  # override the endpoint to reach the Jaeger container on the host:
+  #   -e OTLP_HTTP_ENDPOINT=http://host.docker.internal:4318
+  otlp_http:
+    endpoint: ${env:OTLP_HTTP_ENDPOINT:-http://127.0.0.1:4318}
+    tls:
+      insecure: true
 
 service:
   pipelines:
     logs:
       receivers: [file_log]
+      processors: [transform/rebase]
       exporters: [logs_to_spans]
     traces:
       receivers: [logs_to_spans]
-      exporters: [debug]
+      # debug shows the spans locally; otlp_http ships them to Jaeger, where
+      # they appear as three traces in the UI at http://localhost:16686.
+      exporters: [debug, otlp_http]
