@@ -503,6 +503,8 @@ ocb --config builder-config.yaml
 
 The included `collector.yaml` and `input.log` let you exercise the full pipeline immediately. Spans appear in the debug exporter output and, if Jaeger is running on `127.0.0.1:4317`, in Jaeger UI at `localhost:16686`.
 
+For a minimal Docker-based example with a sample log file, see [`examples/quickstart`](examples/quickstart).
+
 ## Project structure
 
 ```
@@ -520,6 +522,8 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 ├── connector_test.go
 ├── doc.go                       # Package documentation
 ├── documentation.md             # Generated internal-telemetry docs (mdatagen)
+├── examples/
+│   └── quickstart/              # Docker quickstart: sample log, OCB manifest, config
 ├── factory.go                   # OTEL connector factory
 ├── generated_component_test.go  # Generated lifecycle test (mdatagen)
 ├── generated_package_test.go    # Generated goleak TestMain (mdatagen)
@@ -537,6 +541,7 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 
 ### Unreleased
 
+- Added a Docker-based quickstart in [`examples/quickstart`](examples/quickstart) ([#21](https://github.com/agardnerIT/logs-to-spans-otel/issues/21)): a sample `app.log` with plain-text and JSON lines using two group keys, an OCB `manifest.yaml` (file_log receiver, `logs_to_spans` connector, debug exporter), a `collector.yaml` that parses both formats, and a `Dockerfile` that builds the collector and runs it. The example emits three traces and drops the line with no group key. CI now validates the example config alongside the root configs.
 - Removed the last per-record work from the connector's global mutex ([#20](https://github.com/agardnerIT/logs-to-spans-otel/issues/20)). After [#15](https://github.com/agardnerIT/logs-to-spans-otel/issues/15) moved body extraction out of the lock, `addToGroup` still took `c.mu` once per record for a `time.AfterFunc` stop/reset, a resource-attribute deep copy on group creation, and an O(`max_groups`) eviction scan. Now: a single background reaper owns every `timeout`/`max_wait` deadline (one ticker scan instead of two timer create/stop operations per log), there are no per-group timers at all; new groups' resource attributes are deep-copied before the lock; `max_groups` eviction is O(1) off an LRU list; and `ConsumeLogs` batches a batch's records by group key so the lock is taken once per group per call instead of once per record. Flush timing is now bounded by the reaper tick (a quarter of the shorter deadline, clamped to 10ms–1s); `timeout` and `max_wait` semantics are otherwise unchanged, and the reaper is stopped deterministically on `Shutdown`. On an 8-core Apple M2 the parallel grouping benchmark (`max_logs_per_trace` disabled) runs at ~1.5M logs/sec, ~3x the ~495k single-caller baseline, and `addToGroup` falls from ~92% to ~5% of mutex-contention delay; with `max_logs_per_trace` enabled the full pipeline runs at ~735k logs/sec (~1.6x), bound by GC on trace construction rather than the lock. No config surface change.
 - Added contrib-level linting ([#19](https://github.com/agardnerIT/logs-to-spans-otel/issues/19)): a [`.golangci.yml`](.golangci.yml) mirroring opentelemetry-collector-contrib's root config (same linter set and settings, minus the contrib-tree paths that do not exist here) and a `lint` CI job running golangci-lint v2.13.2, the version contrib pins in `internal/tools/go.mod`. The first run is clean; the findings it surfaced are fixed in the same change (test context handling, an if/else chain, empty-assertion style, spelling and formatting). `go vet` is retained as a separate fast step. No user-visible behaviour change.
 - Documentation fixes: the "Including in your own collector build" snippet now matches the collector line this repo builds against (`v0.162.0` core and contrib, `v1.68.0` providers), the Go prerequisite is `1.26+`, the local-development note describes the `replaces:` block the repo actually uses, and a dead Dockerfile link was removed.

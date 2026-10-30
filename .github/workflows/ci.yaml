@@ -60,11 +60,11 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          for cfg in *.yaml; do
+          for cfg in *.yaml examples/*/collector.yaml; do
             # builder-config.yaml is OCB input, not a collector config. The
             # donation metadata files (metadata.yaml, config.schema.yaml) are
-            # not collector configs either. Everything else in the repo root is
-            # a shipped example and must validate.
+            # not collector configs either. Everything else is a shipped
+            # example and must validate.
             case "$cfg" in
               builder-config.yaml|metadata.yaml|config.schema.yaml) continue ;;
             esac

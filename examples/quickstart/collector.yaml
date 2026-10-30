@@ -1,0 +1,38 @@
+receivers:
+  file_log:
+    include: [app.log]
+    start_at: beginning
+    operators:
+      # Split every line into a timestamp, a severity and the rest of the body.
+      - type: regex_parser
+        regex: '^(?P<ts>\S+) (?P<severity>\w+) (?P<body>.*)$'
+        timestamp:
+          parse_from: attributes.ts
+          layout: '%Y-%m-%dT%H:%M:%SZ'
+        # Lines that do not match are kept as-is instead of being dropped.
+        on_error: send_quiet
+      # Parse JSON bodies into a map. Plain-text bodies fail here and are kept
+      # as strings, so one receiver handles both log formats.
+      - type: json_parser
+        parse_from: attributes.body
+        parse_to: body
+        on_error: send_quiet
+
+connectors:
+  logs_to_spans:
+    # user_id matches plain text (user_id=123) and JSON ({"user_id":456}).
+    group_by_keys: [user_id, session_id]
+    timeout: 2s
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers: [file_log]
+      exporters: [logs_to_spans]
+    traces:
+      receivers: [logs_to_spans]
+      exporters: [debug]

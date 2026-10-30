@@ -1,0 +1,8 @@
+2026-01-15T10:00:00Z INFO user_id=123 opened cart
+2026-01-15T10:00:01Z INFO {"user_id":456,"message":"opened cart"}
+2026-01-15T10:00:02Z INFO user_id=123 added item sku=ABC
+2026-01-15T10:00:03Z INFO {"user_id":456,"message":"checked out","items":2}
+2026-01-15T10:00:04Z ERROR user_id=123 payment failed
+2026-01-15T10:00:05Z WARN session_id=abc-789 legacy client connected
+2026-01-15T10:00:06Z INFO session_id=abc-789 legacy client disconnected
+2026-01-15T10:00:07Z INFO no group key on this line

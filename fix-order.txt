@@ -837,10 +837,13 @@ Release / config surface:
   - The Go module proxy caches versions immutably. NEVER move or re-create a
     tag that has already been fetched (do not retag v0.4.0). Cut a new patch
     version instead.
-  - Only collector.yaml is a shipped example config now. CI validates every
-    root *.yaml except builder-config.yaml, metadata.yaml and
-    config.schema.yaml; any other root *.yaml is assumed to be an example and
-    must validate. testdata/*.yaml is used by tests, not by CI validation.
+  - Shipped example configs are collector.yaml and
+    examples/*/collector.yaml. CI validates root *.yaml except
+    builder-config.yaml, metadata.yaml and config.schema.yaml, then every
+    examples/*/collector.yaml; any other root *.yaml is assumed to be an
+    example and must validate. testdata/*.yaml is used by tests, not by CI
+    validation. The examples/quickstart manifest builds the published v0.5.0
+    connector, not the working tree.
 
 CI verification (issue #18 - FIXED, commit eda3916):
   - builder-config.yaml now has
