@@ -51,6 +51,22 @@ func AssertEqualConnectorLogsToSpansGroupsEvicted(t *testing.T, tt *componenttes
 	metricdatatest.AssertEqual(t, want, got, opts...)
 }
 
+func AssertEqualConnectorLogsToSpansInvalidDurations(t *testing.T, tt *componenttest.Telemetry, dps []metricdata.DataPoint[int64], opts ...metricdatatest.Option) {
+	want := metricdata.Metrics{
+		Name:        "otelcol_connector_logs_to_spans_invalid_durations",
+		Description: "Number of duration_keys values rejected because they overflowed or exceeded max_span_duration. [Development]",
+		Unit:        "{log_record}",
+		Data: metricdata.Sum[int64]{
+			Temporality: metricdata.CumulativeTemporality,
+			IsMonotonic: true,
+			DataPoints:  dps,
+		},
+	}
+	got, err := tt.GetMetric("otelcol_connector_logs_to_spans_invalid_durations")
+	require.NoError(t, err)
+	metricdatatest.AssertEqual(t, want, got, opts...)
+}
+
 func AssertEqualConnectorLogsToSpansLogsIngested(t *testing.T, tt *componenttest.Telemetry, dps []metricdata.DataPoint[int64], opts ...metricdatatest.Option) {
 	want := metricdata.Metrics{
 		Name:        "otelcol_connector_logs_to_spans_logs_ingested",
@@ -63,6 +79,54 @@ func AssertEqualConnectorLogsToSpansLogsIngested(t *testing.T, tt *componenttest
 		},
 	}
 	got, err := tt.GetMetric("otelcol_connector_logs_to_spans_logs_ingested")
+	require.NoError(t, err)
+	metricdatatest.AssertEqual(t, want, got, opts...)
+}
+
+func AssertEqualConnectorLogsToSpansRecordsDropped(t *testing.T, tt *componenttest.Telemetry, dps []metricdata.DataPoint[int64], opts ...metricdatatest.Option) {
+	want := metricdata.Metrics{
+		Name:        "otelcol_connector_logs_to_spans_records_dropped",
+		Description: "Number of accepted log records dropped before being emitted as spans, by reason. [Development]",
+		Unit:        "{log_record}",
+		Data: metricdata.Sum[int64]{
+			Temporality: metricdata.CumulativeTemporality,
+			IsMonotonic: true,
+			DataPoints:  dps,
+		},
+	}
+	got, err := tt.GetMetric("otelcol_connector_logs_to_spans_records_dropped")
+	require.NoError(t, err)
+	metricdatatest.AssertEqual(t, want, got, opts...)
+}
+
+func AssertEqualConnectorLogsToSpansRecordsTruncated(t *testing.T, tt *componenttest.Telemetry, dps []metricdata.DataPoint[int64], opts ...metricdatatest.Option) {
+	want := metricdata.Metrics{
+		Name:        "otelcol_connector_logs_to_spans_records_truncated",
+		Description: "Number of log bodies truncated at max_record_bytes. [Development]",
+		Unit:        "{log_record}",
+		Data: metricdata.Sum[int64]{
+			Temporality: metricdata.CumulativeTemporality,
+			IsMonotonic: true,
+			DataPoints:  dps,
+		},
+	}
+	got, err := tt.GetMetric("otelcol_connector_logs_to_spans_records_truncated")
+	require.NoError(t, err)
+	metricdatatest.AssertEqual(t, want, got, opts...)
+}
+
+func AssertEqualConnectorLogsToSpansRecordsWithoutTimestamp(t *testing.T, tt *componenttest.Telemetry, dps []metricdata.DataPoint[int64], opts ...metricdatatest.Option) {
+	want := metricdata.Metrics{
+		Name:        "otelcol_connector_logs_to_spans_records_without_timestamp",
+		Description: "Number of log records that carried neither a timestamp nor an observed timestamp and were stamped with the time the connector processed them. [Development]",
+		Unit:        "{log_record}",
+		Data: metricdata.Sum[int64]{
+			Temporality: metricdata.CumulativeTemporality,
+			IsMonotonic: true,
+			DataPoints:  dps,
+		},
+	}
+	got, err := tt.GetMetric("otelcol_connector_logs_to_spans_records_without_timestamp")
 	require.NoError(t, err)
 	metricdatatest.AssertEqual(t, want, got, opts...)
 }

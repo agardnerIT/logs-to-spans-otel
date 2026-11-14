@@ -53,15 +53,32 @@ connectors:
     timeout: 2s
 
 exporters:
+  # verbosity: normal, not detailed. detailed prints every resource and span
+  # attribute - including group keys, user and session IDs and log bodies - to
+  # container stdout, which is usually collected with broader access and longer
+  # retention than the trace backend. Enable detailed only temporarily, while
+  # debugging, and never with production log bodies.
   debug:
-    verbosity: detailed
+    verbosity: normal
   # OTLP over HTTP/protobuf (component type otlp_http, older name otlphttp).
   # Jaeger's OTLP/HTTP endpoint is 4318. When the collector runs in Docker,
   # override the endpoint to reach the Jaeger container on the host:
-  #   -e OTLP_HTTP_ENDPOINT=http://host.docker.internal:4318
+  #   -e OTLP_HTTP_ENDPOINT=https://host.docker.internal:4318
+  #
+  # insecure: true is only acceptable because the default endpoint is loopback.
+  # Anything that leaves the host - including the override above - carries user
+  # IDs, session IDs and log bodies over the network. For that, use https and
+  # turn verification on:
+  #   tls:
+  #     ca_file: /etc/otel/ca.pem
+  #     cert_file: /etc/otel/client.pem
+  #     key_file: /etc/otel/client-key.pem
+  #     insecure: false
   otlp_http:
     endpoint: ${env:OTLP_HTTP_ENDPOINT:-http://127.0.0.1:4318}
     tls:
+      # Loopback only. Set insecure: false (and the scheme to https) for any
+      # non-loopback endpoint.
       insecure: true
 
 service:

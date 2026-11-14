@@ -116,11 +116,28 @@ func sendLogsWithMultipleResources(t *testing.T, conn connector.Logs, resources 
 	require.NoError(t, conn.ConsumeLogs(t.Context(), ld))
 }
 
+// flatTraces returns every emitted ResourceSpans as a standalone ptrace.Traces.
+// The connector batches the groups it retires in one tick (or one shutdown
+// flush) into a single ConsumeTraces call, with each group as one
+// ResourceSpans, so a test that reasons about "one trace" must look at one
+// ResourceSpans rather than at one ConsumeTraces call.
+func flatTraces(sink *consumertest.TracesSink) []ptrace.Traces {
+	var out []ptrace.Traces
+	for _, td := range sink.AllTraces() {
+		for i := range td.ResourceSpans().Len() {
+			single := ptrace.NewTraces()
+			td.ResourceSpans().At(i).CopyTo(single.ResourceSpans().AppendEmpty())
+			out = append(out, single)
+		}
+	}
+	return out
+}
+
 // addTestRecord feeds one record straight into the grouping path with no source
 // resource attributes, matching a source that sets none. Resource-aware cases
 // call addToGroup directly with a populated pcommon.Map.
 func addTestRecord(c *logsToSpansConnector, key string, lr plog.LogRecord) {
-	c.addToGroup(key, pcommon.NewMap(), extractLogRecord(lr, c.config))
+	c.addToGroup(key, pcommon.NewMap(), extractLogRecord(lr, c.config, c.extractOpts))
 }
 
 func TestConfigDefaults(t *testing.T) {
@@ -130,6 +147,13 @@ func TestConfigDefaults(t *testing.T) {
 	assert.Empty(t, cfg.ServiceName, "empty means preserve the source service.name")
 	assert.Equal(t, 30*time.Second, cfg.MaxWait)
 	assert.Equal(t, 1000, cfg.MaxGroups)
+	assert.Equal(t, 16<<10, cfg.MaxRecordBytes)
+	assert.Equal(t, 4<<20, cfg.MaxGroupBytes)
+	assert.Equal(t, 24*time.Hour, cfg.MaxSpanDuration)
+	assert.Equal(t, 200, cfg.MaxSpanNameLength)
+	assert.False(t, cfg.IncludeBodyAttribute, "log.body duplicates the span name and is opt-in")
+	assert.False(t, cfg.RequireSpanID)
+	assert.Equal(t, "{truncated:120:body}", defaultSpanNameTemplate)
 	assert.True(t, cfg.CopyResourceAttributes)
 	assert.Empty(t, cfg.GroupByKeys)
 	assert.Empty(t, cfg.GroupByAttributes)
@@ -312,7 +336,7 @@ func TestAttributesOnlyConfigProducesTraces(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2, "one trace per distinct attribute value")
 
 	var spans int
@@ -366,7 +390,7 @@ func TestBasicGrouping(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "expected exactly one trace export")
 
 	td := traces[0]
@@ -401,7 +425,7 @@ func TestMultipleGroups(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	assert.Len(t, traces, 2, "expected two traces (one per group)")
 
 	spans := 0
@@ -427,7 +451,7 @@ func TestEndSpanDuration(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -461,7 +485,7 @@ func TestSortByTimestamp(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -480,6 +504,7 @@ func TestShutdown(t *testing.T) {
 	cfg := createDefaultConfig()
 	cfg.Timeout = 1 * time.Hour
 	cfg.GroupByKeys = []string{"user"}
+	cfg.IncludeBodyAttribute = true
 	conn := createTestConnector(t, cfg, sink)
 
 	now := time.Now()
@@ -488,7 +513,7 @@ func TestShutdown(t *testing.T) {
 
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "expected trace export on shutdown")
 
 	// span must exist and record the log body
@@ -513,7 +538,7 @@ func TestEmptyGroupByKeys(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	assert.Empty(t, traces, "no traces should be produced without any group-by keys")
 }
 
@@ -530,7 +555,7 @@ func TestSeverityAttribute(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -555,7 +580,7 @@ func TestLogBodyAsSpanName(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -579,7 +604,7 @@ func TestServiceNameOnResource(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -603,7 +628,7 @@ func TestMultipleKeyCandidates(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "r1 and r2 should be grouped by value 456")
 	assert.Equal(t, 2, traces[0].SpanCount())
 }
@@ -624,7 +649,7 @@ func TestDurationFromAttribute(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -657,7 +682,7 @@ func TestDurationFromAttributeFallbackToNextKey(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -692,7 +717,7 @@ func TestDurationFromIntAttribute(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -727,7 +752,7 @@ func TestTimestampPriorityOverObservedTimestamp(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	rs := traces[0].ResourceSpans().At(0)
@@ -904,7 +929,7 @@ func TestUnmatchedRecordsAreDropped(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "unmatched records must not create a second trace")
 	assert.Equal(t, 1, traces[0].SpanCount(), "only the matched record becomes a span")
 }
@@ -1017,6 +1042,7 @@ func TestConsumeLogsDoesNotRetainSourcePdata(t *testing.T) {
 	// Keep the group buffered so the flush happens after the source is mutated.
 	cfg.Timeout = time.Hour
 	cfg.MaxWait = time.Hour
+	cfg.IncludeBodyAttribute = true
 	conn := createTestConnector(t, cfg, sink)
 
 	ld := plog.NewLogs()
@@ -1038,7 +1064,7 @@ func TestConsumeLogsDoesNotRetainSourcePdata(t *testing.T) {
 
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	spans := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans()
 	require.Equal(t, 1, spans.Len())
@@ -1069,7 +1095,7 @@ func TestShutdownWithNoGroups(t *testing.T) {
 
 	err := conn.Shutdown(t.Context())
 	assert.NoError(t, err)
-	assert.Empty(t, sink.AllTraces())
+	assert.Empty(t, flatTraces(sink))
 }
 
 func TestMultipleShutdownCalls(t *testing.T) {
@@ -1100,7 +1126,7 @@ func TestShutdownThenConsumeLogs(t *testing.T) {
 	require.NoError(t, err)
 	_ = r1
 
-	assert.Empty(t, sink.AllTraces())
+	assert.Empty(t, flatTraces(sink))
 }
 
 func TestMultipleResourceLogsEntries(t *testing.T) {
@@ -1130,7 +1156,7 @@ func TestMultipleResourceLogsEntries(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	assert.Equal(t, 2, traces[0].SpanCount())
 }
@@ -1162,7 +1188,7 @@ func TestMultipleScopeLogsEntries(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	assert.Equal(t, 2, traces[0].SpanCount())
 }
@@ -1183,7 +1209,7 @@ func TestMultipleLogRecordsInSingleScope(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	assert.Equal(t, 3, traces[0].SpanCount())
 }
@@ -1201,7 +1227,7 @@ func TestSpanScopeName(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	ss := traces[0].ResourceSpans().At(0).ScopeSpans().At(0)
@@ -1221,7 +1247,7 @@ func TestSpanKindInternal(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1241,7 +1267,7 @@ func TestNoSeverityAttributeWhenEmpty(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1262,7 +1288,7 @@ func TestGroupKeyAttributeOnSpan(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1276,6 +1302,7 @@ func TestLogBodyAttributeOnSpan(t *testing.T) {
 	cfg := createDefaultConfig()
 	cfg.Timeout = 100 * time.Millisecond
 	cfg.GroupByKeys = []string{"user"}
+	cfg.IncludeBodyAttribute = true
 	conn := createTestConnector(t, cfg, sink)
 
 	now := time.Now()
@@ -1284,7 +1311,7 @@ func TestLogBodyAttributeOnSpan(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1309,7 +1336,7 @@ func TestParentChildChainThreeSpans(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	ss := traces[0].ResourceSpans().At(0).ScopeSpans().At(0)
 	require.Equal(t, 3, ss.Spans().Len())
@@ -1347,7 +1374,7 @@ func TestDurationFromDoubleAttribute(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span0 := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1378,7 +1405,7 @@ func TestDurationFromInvalidStringAttribute(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span0 := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1402,7 +1429,7 @@ func TestDurationKeysEmptyMeansNoOverride(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span0 := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1424,7 +1451,7 @@ func TestMaxWaitForceFlush(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "max_wait should force-flush the group")
 	assert.Equal(t, 1, traces[0].SpanCount())
 }
@@ -1445,7 +1472,7 @@ func TestTwoConcurrentGroupsFlushIndependently(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2, "should have 2 traces for 2 different user groups")
 
 	totalSpans := 0
@@ -1469,7 +1496,7 @@ func TestSingleLogProducesSingleSpanWithEndSpanDuration(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1498,7 +1525,7 @@ func TestObservedTimestampUsedWhenNoTimestamp(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -1560,7 +1587,7 @@ func TestUnstructuredKeyValueWithHyphen(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	val, ok := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().Get("group.key")
@@ -1637,8 +1664,8 @@ func TestMaxGroupsEvictsLeastRecentlyUpdated(t *testing.T) {
 	assert.True(t, hasC, "the new group must be admitted")
 
 	// Eviction flushes the victim rather than dropping it.
-	require.Len(t, sink.AllTraces(), 1)
-	assert.Equal(t, 1, sink.AllTraces()[0].SpanCount())
+	require.Len(t, flatTraces(sink), 1)
+	assert.Equal(t, 1, flatTraces(sink)[0].SpanCount())
 }
 
 // With equal lastUpdated timestamps eviction still has a deterministic victim:
@@ -1698,7 +1725,7 @@ func TestMaxGroupsEvictionPreservesEveryRecord(t *testing.T) {
 	require.NoError(t, conn.Shutdown(t.Context()))
 
 	seen := 0
-	for _, td := range sink.AllTraces() {
+	for _, td := range flatTraces(sink) {
 		seen += td.SpanCount()
 	}
 	assert.Equal(t, keys, seen, "no evicted record may be dropped or duplicated")
@@ -1723,7 +1750,7 @@ func TestMaxGroupsZeroMeansUnlimited(t *testing.T) {
 	c.mu.Unlock()
 
 	assert.Equal(t, 50, got, "max_groups: 0 must disable the cap")
-	assert.Empty(t, sink.AllTraces(), "nothing may be evicted with the cap disabled")
+	assert.Empty(t, flatTraces(sink), "nothing may be evicted with the cap disabled")
 }
 
 // ConsumeLogs groups a whole batch's records by key and takes the connector
@@ -1736,6 +1763,7 @@ func TestConsumeLogsBatchesRecordsByGroupKey(t *testing.T) {
 	cfg.Timeout = 10 * time.Second
 	cfg.MaxWait = 10 * time.Second
 	cfg.GroupByKeys = []string{"user"}
+	cfg.IncludeBodyAttribute = true
 	conn := createTestConnector(t, cfg, sink)
 
 	base := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
@@ -1748,7 +1776,7 @@ func TestConsumeLogsBatchesRecordsByGroupKey(t *testing.T) {
 	})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2, "one trace per distinct key")
 
 	bodiesByKey := map[string][]string{}
@@ -1776,6 +1804,7 @@ func TestEqualTimestampsKeepArrivalOrder(t *testing.T) {
 	cfg.Timeout = 10 * time.Second
 	cfg.MaxWait = 10 * time.Second
 	cfg.GroupByKeys = []string{"user"}
+	cfg.IncludeBodyAttribute = true
 	conn := createTestConnector(t, cfg, sink)
 
 	// Same timestamp on every record, and no Timestamp set at all, so the
@@ -1788,7 +1817,7 @@ func TestEqualTimestampsKeepArrivalOrder(t *testing.T) {
 	})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	ss := traces[0].ResourceSpans().At(0).ScopeSpans().At(0)
 	require.Equal(t, 3, ss.Spans().Len())
@@ -1823,7 +1852,7 @@ func TestMaxGroupsAddingToExistingKeyDoesNotEvict(t *testing.T) {
 
 	require.NotNil(t, got)
 	assert.Len(t, got.records, 2, "both records must stay in the same group")
-	assert.Empty(t, sink.AllTraces(), "no eviction for an existing key")
+	assert.Empty(t, flatTraces(sink), "no eviction for an existing key")
 }
 
 // The evicted group's already-queued timer callback must not emit it twice.
@@ -1847,12 +1876,12 @@ func TestMaxGroupsEvictionIsNotReEmittedByStaleCallback(t *testing.T) {
 
 	// Admitting b evicts and flushes a.
 	addTestRecord(c, "b", newLogRecord("user=b one", now, "INFO"))
-	require.Len(t, sink.AllTraces(), 1)
+	require.Len(t, flatTraces(sink), 1)
 
 	// The evicted group's timer may still have a callback queued.
 	c.flushGroup("a", victim)
 
-	require.Len(t, sink.AllTraces(), 1, "an evicted group must be emitted exactly once")
+	require.Len(t, flatTraces(sink), 1, "an evicted group must be emitted exactly once")
 }
 
 // A group created by a max_logs_per_trace split replaces a flushed group and
@@ -1907,7 +1936,7 @@ func TestMaxLogsPerTraceFlushesAtLimit(t *testing.T) {
 	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4, r5})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2, "expected 2 traces: 3 logs in first, 2 in second")
 	assert.Equal(t, 3, traces[0].SpanCount())
 	assert.Equal(t, 2, traces[1].SpanCount())
@@ -1934,7 +1963,7 @@ func TestMaxLogsPerTraceExactLimit(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2, "expected 2 traces: 3+3 logs")
 	assert.Equal(t, 3, traces[0].SpanCount())
 	assert.Equal(t, 3, traces[1].SpanCount())
@@ -1957,7 +1986,7 @@ func TestMaxLogsPerTraceBelowLimit(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "expected 1 trace flushed by timeout")
 	assert.Equal(t, 2, traces[0].SpanCount())
 }
@@ -1981,7 +2010,7 @@ func TestMaxLogsPerTraceZeroMeansNoLimit(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "expected 1 trace with all 10 spans")
 	assert.Equal(t, 10, traces[0].SpanCount())
 }
@@ -2004,7 +2033,7 @@ func TestMaxLogsPerTraceSpanLinks(t *testing.T) {
 	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2)
 
 	firstSpanOfSecondTrace := traces[1].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
@@ -2037,7 +2066,7 @@ func TestMaxLogsPerTraceSpanLinkChain(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 3, "expected 3 traces: 3+3+3")
 
 	// Trace B links to Trace A
@@ -2073,7 +2102,7 @@ func TestMaxLogsPerTraceSeparateGroups(t *testing.T) {
 	sendLogs(t, conn, []plog.LogRecord{r1, r2, r3, r4, r5, r6})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 4, "expected 4 traces: 2 per user")
 
 	aaaTraces := 0
@@ -2108,7 +2137,7 @@ func TestMaxLogsPerTraceWithTimeout(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "timeout should flush the group")
 	assert.Equal(t, 2, traces[0].SpanCount())
 }
@@ -2157,14 +2186,14 @@ func TestStaleTimerCallbackDoesNotEvictReplacementGroup(t *testing.T) {
 
 	// The split already emitted g1's records. The stale callback must not emit
 	// them a second time.
-	require.Len(t, sink.AllTraces(), 1)
-	assert.Equal(t, 2, sink.AllTraces()[0].SpanCount())
+	require.Len(t, flatTraces(sink), 1)
+	assert.Equal(t, 2, flatTraces(sink)[0].SpanCount())
 
 	// g2 keeps collecting, and its trace links back to the split trace.
 	addTestRecord(c, "user=123", newLogRecord("user=123 log3", now.Add(2*time.Second), "INFO"))
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2, "records held by g2 must not be lost")
 	assert.Equal(t, 1, traces[1].SpanCount())
 
@@ -2196,8 +2225,8 @@ func TestFlushGroupIsIdempotent(t *testing.T) {
 	c.flushGroup("user=123", g)
 	c.flushGroup("user=123", g)
 
-	require.Len(t, sink.AllTraces(), 1, "group must be emitted exactly once")
-	assert.Equal(t, 1, sink.AllTraces()[0].SpanCount())
+	require.Len(t, flatTraces(sink), 1, "group must be emitted exactly once")
+	assert.Equal(t, 1, flatTraces(sink)[0].SpanCount())
 
 	c.mu.Lock()
 	_, ok := c.groups["user=123"]
@@ -2239,7 +2268,7 @@ func TestConcurrentSplitAndFlush(t *testing.T) {
 	require.NoError(t, conn.Shutdown(t.Context()))
 
 	seen := 0
-	for _, td := range sink.AllTraces() {
+	for _, td := range flatTraces(sink) {
 		seen += td.SpanCount()
 	}
 	assert.Equal(t, goroutines*perGoroutine, seen, "no record may be dropped or duplicated")
@@ -2261,7 +2290,7 @@ func TestCopyResourceAttributesToOutput(t *testing.T) {
 	}, []plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	attrs := traces[0].ResourceSpans().At(0).Resource().Attributes().AsRaw()
@@ -2286,7 +2315,7 @@ func TestCopyResourceAttributesDisabled(t *testing.T) {
 	}, []plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 
 	attrs := traces[0].ResourceSpans().At(0).Resource().Attributes().AsRaw()
@@ -2308,7 +2337,7 @@ func TestServiceNamePreservedFromSource(t *testing.T) {
 		[]plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	val, ok := traces[0].ResourceSpans().At(0).Resource().Attributes().Get("service.name")
 	require.True(t, ok)
@@ -2328,7 +2357,7 @@ func TestServiceNameExplicitOverridesSource(t *testing.T) {
 		[]plog.LogRecord{newLogRecord("user=123 hello", now, "INFO")})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	val, ok := traces[0].ResourceSpans().At(0).Resource().Attributes().Get("service.name")
 	require.True(t, ok)
@@ -2356,7 +2385,7 @@ func TestMergedGroupUsesFirstResource(t *testing.T) {
 		})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "resource attributes do not scope groups by default")
 	assert.Equal(t, 2, traces[0].SpanCount())
 	attrs := traces[0].ResourceSpans().At(0).Resource().Attributes().AsRaw()
@@ -2383,7 +2412,7 @@ func TestGroupByResourceAttributesSeparatesGroups(t *testing.T) {
 		})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2, "the same key from different services must not merge")
 
 	seen := map[string]string{}
@@ -2418,7 +2447,7 @@ func TestGroupByResourceAttributesMissingAttributeCollapses(t *testing.T) {
 		})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1, "resources missing the scoping attribute collapse together")
 	assert.Equal(t, 2, traces[0].SpanCount())
 }
@@ -2440,7 +2469,7 @@ func TestSplitReplacementKeepsResource(t *testing.T) {
 		})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2, "max_logs_per_trace 1 splits each record")
 	for _, td := range traces {
 		attrs := td.ResourceSpans().At(0).Resource().Attributes().AsRaw()
@@ -2617,7 +2646,7 @@ func TestRecordTraceContextProducesSpanLink(t *testing.T) {
 	sendLogs(t, conn, []plog.LogRecord{lr})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
 	require.Equal(t, 1, span.Links().Len(), "a span from a record with trace context must link to it")
@@ -2638,7 +2667,7 @@ func TestAttributeTraceContextProducesSpanLink(t *testing.T) {
 	sendLogs(t, conn, []plog.LogRecord{lr})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	span := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
 	require.Equal(t, 1, span.Links().Len())
@@ -2664,7 +2693,7 @@ func TestEachRecordLinksToItsOwnOrigin(t *testing.T) {
 	sendLogs(t, conn, []plog.LogRecord{r1, r2})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	spans := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans()
 	require.Equal(t, 2, spans.Len())
@@ -2686,7 +2715,7 @@ func TestNoTraceContextProducesNoLinks(t *testing.T) {
 	})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 1)
 	spans := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans()
 	require.Equal(t, 1, spans.Len())
@@ -2712,7 +2741,7 @@ func TestOriginatingAndChainLinksCoexist(t *testing.T) {
 	sendLogs(t, conn, []plog.LogRecord{r1, r2})
 	require.NoError(t, conn.Shutdown(t.Context()))
 
-	traces := sink.AllTraces()
+	traces := flatTraces(sink)
 	require.Len(t, traces, 2)
 	second := traces[1].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
 	require.Equal(t, 2, second.Links().Len(), "the split span carries both its origin link and the chain link")

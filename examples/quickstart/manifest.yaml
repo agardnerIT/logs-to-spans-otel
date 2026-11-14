@@ -5,8 +5,14 @@ dist:
   output_path: ./otelcol-dist
 
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.6.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.7.0"
     name: "logs_to_spans"
+
+# Build the connector from the working tree, not the published v0.7.0 tag, so
+# the quickstart image contains the code in this checkout. The path is resolved
+# relative to output_path (./otelcol-dist), so ../ is the repository root.
+replaces:
+  - github.com/agardnerIT/logs-to-spans-otel => ../
 
 receivers:
   - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.162.0"

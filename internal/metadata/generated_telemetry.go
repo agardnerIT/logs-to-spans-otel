@@ -25,14 +25,18 @@ func Tracer(settings component.TelemetrySettings) trace.Tracer {
 // TelemetryBuilder provides an interface for components to report telemetry
 // as defined in metadata and user config.
 type TelemetryBuilder struct {
-	meter                                metric.Meter
-	mu                                   sync.Mutex
-	registrations                        []metric.Registration
-	ConnectorLogsToSpansActiveGroups     metric.Int64ObservableGauge
-	ConnectorLogsToSpansGroupsEvicted    metric.Int64Counter
-	ConnectorLogsToSpansLogsIngested     metric.Int64Counter
-	ConnectorLogsToSpansTracesCreated    metric.Int64Counter
-	ConnectorLogsToSpansUnmatchedDropped metric.Int64Counter
+	meter                                       metric.Meter
+	mu                                          sync.Mutex
+	registrations                               []metric.Registration
+	ConnectorLogsToSpansActiveGroups            metric.Int64ObservableGauge
+	ConnectorLogsToSpansGroupsEvicted           metric.Int64Counter
+	ConnectorLogsToSpansInvalidDurations        metric.Int64Counter
+	ConnectorLogsToSpansLogsIngested            metric.Int64Counter
+	ConnectorLogsToSpansRecordsDropped          metric.Int64Counter
+	ConnectorLogsToSpansRecordsTruncated        metric.Int64Counter
+	ConnectorLogsToSpansRecordsWithoutTimestamp metric.Int64Counter
+	ConnectorLogsToSpansTracesCreated           metric.Int64Counter
+	ConnectorLogsToSpansUnmatchedDropped        metric.Int64Counter
 }
 
 // TelemetryBuilderOption applies changes to default builder.
@@ -101,9 +105,33 @@ func NewTelemetryBuilder(settings component.TelemetrySettings, options ...Teleme
 		metric.WithUnit("{group}"),
 	)
 	errs = errors.Join(errs, err)
+	builder.ConnectorLogsToSpansInvalidDurations, err = builder.meter.Int64Counter(
+		"otelcol_connector_logs_to_spans_invalid_durations",
+		metric.WithDescription("Number of duration_keys values rejected because they overflowed or exceeded max_span_duration. [Development]"),
+		metric.WithUnit("{log_record}"),
+	)
+	errs = errors.Join(errs, err)
 	builder.ConnectorLogsToSpansLogsIngested, err = builder.meter.Int64Counter(
 		"otelcol_connector_logs_to_spans_logs_ingested",
 		metric.WithDescription("Number of log records consumed by the connector. [Development]"),
+		metric.WithUnit("{log_record}"),
+	)
+	errs = errors.Join(errs, err)
+	builder.ConnectorLogsToSpansRecordsDropped, err = builder.meter.Int64Counter(
+		"otelcol_connector_logs_to_spans_records_dropped",
+		metric.WithDescription("Number of accepted log records dropped before being emitted as spans, by reason. [Development]"),
+		metric.WithUnit("{log_record}"),
+	)
+	errs = errors.Join(errs, err)
+	builder.ConnectorLogsToSpansRecordsTruncated, err = builder.meter.Int64Counter(
+		"otelcol_connector_logs_to_spans_records_truncated",
+		metric.WithDescription("Number of log bodies truncated at max_record_bytes. [Development]"),
+		metric.WithUnit("{log_record}"),
+	)
+	errs = errors.Join(errs, err)
+	builder.ConnectorLogsToSpansRecordsWithoutTimestamp, err = builder.meter.Int64Counter(
+		"otelcol_connector_logs_to_spans_records_without_timestamp",
+		metric.WithDescription("Number of log records that carried neither a timestamp nor an observed timestamp and were stamped with the time the connector processed them. [Development]"),
 		metric.WithUnit("{log_record}"),
 	)
 	errs = errors.Join(errs, err)

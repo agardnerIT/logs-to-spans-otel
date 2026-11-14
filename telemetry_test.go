@@ -157,7 +157,7 @@ func TestMetricsTracesCreatedCountsEveryGroup(t *testing.T) {
 
 	counters := collectInt64Counters(t, reader)
 	assert.Equal(t, int64(3), counters[metricTracesCreated])
-	require.Len(t, sink.AllTraces(), 3)
+	require.Len(t, flatTraces(sink), 3)
 }
 
 // TestMetricsGroupsEvictedCounter covers issue #11: an eviction caused by
@@ -223,4 +223,50 @@ func TestMetricsNilMeterProviderFallsBackToNoop(t *testing.T) {
 		newLogRecord("unmatched", now, "INFO"),
 	})
 	require.NoError(t, conn.Shutdown(t.Context()))
+}
+
+// dataPointCount returns how many data points a metric recorded, which is how
+// the test below observes that a counter was touched once per batch rather than
+// once per record.
+func dataPointCount(t *testing.T, reader *metric.ManualReader, name string) int {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			return len(sum.DataPoints)
+		}
+	}
+	return 0
+}
+
+// TestMetricsAreRecordedPerBatch covers issue #28: the ingest counter is added
+// once per ConsumeLogs batch, not once per record. The value is unchanged; only
+// the number of instrument calls drops.
+func TestMetricsAreRecordedPerBatch(t *testing.T) {
+	sink := newTestSink()
+	cfg := metricsTestConfig()
+	cfg.Timeout = time.Hour
+	cfg.MaxWait = time.Hour
+	conn, reader := createMetricsTestConnector(t, cfg, sink)
+
+	now := time.Now()
+	var records []plog.LogRecord
+	for range 50 {
+		records = append(records, newLogRecord("user=123 same group", now, "INFO"))
+	}
+	sendLogs(t, conn, records)
+
+	counters := collectInt64Counters(t, reader)
+	assert.Equal(t, int64(50), counters[metricLogsIngested])
+	assert.Equal(t, 1, dataPointCount(t, reader, metricLogsIngested),
+		"one measurement per batch, not one per record")
 }

@@ -140,31 +140,44 @@ linters:
 
     gosec:
       excludes:
+        # Integer conversion warnings on values whose range is already checked
+        # by the surrounding code (parseDuration bounds the seconds first).
         - G115
+        # TLS verification is not the connector's decision: exporters are
+        # configured by the operator, and the shipped examples explain why
+        # insecure: true is loopback-only.
         - G402
+        # math/rand is never used for IDs: the generator is seeded from
+        # crypto/rand (see idGenerator), so G404 does not apply to this module.
         - G404
-        # New in gosec v2.28.0 (golangci-lint v2.13.1 bump); excluded in
-        # contrib pending triage, kept in sync here.
-        - G113
-        - G117
-        - G118
-        - G119
-        - G120
-        - G121
-        - G122
-        - G123
-        - G124
-        - G408
-        - G701
-        - G702
-        - G703
-        - G704
-        - G705
-        - G706
-        - G707
-        - G708
-        - G709
-        - G710
+        # New in gosec v2.28.0 (golangci-lint v2.13.1 bump). Still excluded to
+        # stay in sync with contrib's pending triage; each is listed with the
+        # reason it cannot fire in this component, so a reviewer can see that
+        # the exclusion was considered rather than inherited.
+        - G113  # no syscall or cgo
+        - G117  # no secret fields in config
+        - G119  # no unsafe memory reuse
+        - G120  # no unsafe conversions
+        - G121  # no unsafe slicing
+        - G122  # no filepath.Walk
+        - G123  # no TLS resumption
+        - G124  # no TLS curve preferences
+        - G408  # no SSH
+        - G701  # no database/sql
+        - G702  # no exec.Command
+        - G703  # no filesystem paths from config
+        - G704  # downstream endpoints come from operator config, not records
+        - G705  # no XSS sink (no templates, no HTML)
+        - G707  # no reflect-based unsafe
+        - G708  # no reflection on untrusted types
+        - G709  # no unsafe deserialisation
+        - G710  # no unvalidated redirect
+        # G118 (goroutine with context.Background / missing cancel) is
+        # deliberately NOT excluded: the reaper and export workers were exactly
+        # the pattern it targets, and every downstream call now derives a
+        # bounded context. G706 (log injection) is also enabled: span names and
+        # log lines carry application-controlled text, so the code must keep
+        # using structured fields instead of string concatenation.
 
     govet:
       # TODO: Enable this and fix the alignment issues.

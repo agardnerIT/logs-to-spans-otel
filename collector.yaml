@@ -1,6 +1,6 @@
 receivers:
   filelog:
-    include: [input.log]
+    include: [examples/plaintext/input.log]
     start_at: beginning
     operators:
       # Most lines in input.log have no timestamp prefix, so the operator is
@@ -33,11 +33,17 @@ connectors:
     span_name_template: "{truncated:120:body}"
 
 exporters:
+  # verbosity: normal, not detailed: detailed writes every attribute - including
+  # group keys (UID, userID, sess_id here) and any log.body the connector
+  # attaches - to collector stdout. Use it only while debugging.
   debug:
-    verbosity: detailed
+    verbosity: normal
   otlp/jaeger:
     endpoint: 127.0.0.1:4317
     tls:
+      # Loopback only. Any non-loopback endpoint must use TLS with verification:
+      # set insecure: false and a ca_file (or use https via the otlp/jaeger
+      # exporter's endpoint scheme). This demo carries user and session IDs.
       insecure: true
 
 service:

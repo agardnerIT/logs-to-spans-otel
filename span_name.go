@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // defaultSpanNameTemplate is the span_name_template used when the option is
-// absent. It reproduces the historical behavior of naming the span after the
-// full log body.
-const defaultSpanNameTemplate = "{body}"
+// absent. It keeps the first 120 characters of the log body: a span name is a
+// low-cardinality grouping key in every backend, so naming a span after the
+// whole line produces one unique name per span, defeats aggregation and
+// inflates each index. 120 characters is what most UIs display anyway.
+const defaultSpanNameTemplate = "{truncated:120:body}"
 
 // spanNamePlaceholder identifies what a compiled template part reads from a log
 // record. Parsing happens once, in Validate and in the factory, so rendering a
@@ -115,6 +118,44 @@ func parseSpanNamePlaceholder(expr string) (spanNamePart, error) {
 	}
 }
 
+// bodyRequirement describes what a compiled template needs from the log body,
+// so extraction can skip (or bound) the body serialization the template will
+// never read. For a Map body that serialization is the dominant per-record
+// cost: pcommon.Value.AsString JSON-encodes the whole value.
+type bodyRequirement struct {
+	// full is true when the template expands the whole body.
+	full bool
+	// truncated is the largest {truncated:N:body} count in the template, or 0
+	// when the template has no truncated body placeholder.
+	truncated int
+	// mayRenderEmpty is true when every part of the template is a placeholder
+	// that can expand to nothing. Such a template can render an empty name,
+	// which falls back to the body, so the body is needed even though the
+	// template does not mention it.
+	mayRenderEmpty bool
+}
+
+// bodyRequirement reports what this template reads from the log body.
+func (t *spanNameTemplate) bodyRequirement() bodyRequirement {
+	req := bodyRequirement{mayRenderEmpty: len(t.parts) > 0}
+	for _, part := range t.parts {
+		switch part.kind {
+		case spanNameBody:
+			req.full = true
+		case spanNameTruncatedBody:
+			req.truncated = max(req.truncated, part.limit)
+		case spanNameLiteral:
+			if part.text != "" {
+				req.mayRenderEmpty = false
+			}
+		case spanNameSeverity:
+			// A severity placeholder can expand to nothing, so it does not
+			// change mayRenderEmpty.
+		}
+	}
+	return req
+}
+
 // render expands the template for one log record.
 func (t *spanNameTemplate) render(rec *logRecord) string {
 	var b strings.Builder
@@ -148,4 +189,21 @@ func truncateRunes(s string, n int) string {
 		count++
 	}
 	return s
+}
+
+// truncateBytes returns at most n bytes from the start of s without splitting a
+// multi-byte character. It is the byte-oriented counterpart of truncateRunes,
+// used where the limit is a size bound rather than a display width.
+func truncateBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	cut := s[:n]
+	for cut != "" && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }

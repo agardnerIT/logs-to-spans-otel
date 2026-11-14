@@ -1,0 +1,40 @@
+version: 2
+
+updates:
+  # The connector module and the throwaway collector distribution both have a
+  # go.mod; a vulnerable transitive dependency ships inside every collector that
+  # includes this component.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      otel:
+        patterns:
+          - 'go.opentelemetry.io/*'
+      all-other:
+        patterns:
+          - '*'
+
+  - package-ecosystem: gomod
+    directory: /otelcol-dist
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Actions are pinned by commit SHA in the workflows; Dependabot is what keeps
+  # those pins fresh.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The quickstart Dockerfile pins its base images by digest (see
+  # examples/quickstart/Dockerfile); this keeps those digests current.
+  - package-ecosystem: docker
+    directory: /examples/quickstart
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

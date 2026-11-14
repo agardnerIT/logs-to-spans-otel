@@ -21,8 +21,8 @@ The fastest way to see it work is the Docker example. It builds a collector from
 
 ```sh
 git clone https://github.com/agardnerIT/logs-to-spans-otel
-cd logs-to-spans-otel/examples/quickstart
-docker build -t logs-to-spans-quickstart .
+cd logs-to-spans-otel
+docker build -f examples/quickstart/Dockerfile -t logs-to-spans-quickstart .
 docker run --rm logs-to-spans-quickstart
 ```
 
@@ -114,6 +114,8 @@ The connector reads explicit span durations from log attributes by checking each
 
 Logs without a valid duration attribute fall back to the default behaviour: each span's duration is the time delta to the next log, and the last span in a trace uses `end_span_duration`.
 
+A duration value that cannot be represented, or that exceeds `max_span_duration` (default `24h`, `0` disables), is ignored and the next configured key is tried. Both cases are counted by `otelcol_connector_logs_to_spans_invalid_durations`, so a producer sending nonsense is visible instead of silently producing a wrong span end time. The bound exists because `time.Duration` is an `int64` of nanoseconds: a value above ~292 years overflows, and the wrapped result can be positive but tiny, which would pass a naive `> 0` check and end the span 192 ms after it started.
+
 ### Linking to the originating trace
 
 When a log record already carries trace context, the span generated from it links back to that trace, so a trace derived from a legacy log stays connected to the real trace it came from. This is the point of the connector for migration: modern services are instrumented, older ones log, and the span link joins the two.
@@ -127,6 +129,13 @@ Values may be 32/16-character hex strings or raw bytes. Anything invalid — wro
 
 Every span in the generated trace links to its own record's origin, not just the first span. This is separate from the `max_logs_per_trace` chain link that connects consecutive generated traces, so a span can carry both.
 
+**Trust boundary.** An attribute is written by whoever produced the log line, so `trace_id_keys` / `span_id_keys` values are attacker-influenced whenever the log source is not fully trusted. The connector validates the *format* of an ID, never its provenance: a compromised application, or another tenant sharing the pipeline, can make its spans link to an arbitrary trace ID (trace poisoning, and an oracle for which trace IDs exist). Two options if that matters:
+
+- set `trace_id_keys: []` and `span_id_keys: []`, leaving only record-level trace context, which an application cannot set directly in a text log — it has to come from a receiver or a collector-side operator;
+- set `require_span_id: true`, so a link is only emitted when both IDs are present, and a forged half-link is dropped.
+
+See [Handling sensitive data and untrusted logs](#handling-sensitive-data-and-untrusted-logs).
+
 The incoming trace ID is **not** adopted as the generated trace's ID. A group can hold records from several originating traces, so adopting one would misattribute the others; the link records the relationship without merging two real traces into one. Use `group_by_resource_attributes` to keep sources apart.
 
 ### Span naming
@@ -135,9 +144,9 @@ The incoming trace ID is **not** adopted as the generated trace's ID. A group ca
 
 | Placeholder | Expands to |
 |-------------|------------|
-| `{body}` | the full log body — the default |
+| `{body}` | the full log body |
 | `{severity}` | the log record's severity text (`ERROR`, `INFO`, ...), empty when the record carries none |
-| `{truncated:N:body}` | the first `N` characters of the body, counted in characters rather than bytes so a multi-byte character is never split |
+| `{truncated:N:body}` | the first `N` characters of the body, counted in characters rather than bytes so a multi-byte character is never split — **the default**, `{truncated:120:body}` |
 
 Anything else is copied through literally, so `{severity}: {body}` produces `ERROR: user=123 connection reset`, and `{severity}: {truncated:120:body}` keeps the severity prefix while capping the name length. Capping is the usual reason to set this option: a span name is an indexed, potentially high-cardinality field, and the raw body can be many kilobytes.
 
@@ -148,10 +157,12 @@ connectors:
     span_name_template: "{severity}: {truncated:120:body}"
 ```
 
-- The default is `{body}` — the full log body — for backward compatibility.
+- The default is `{truncated:120:body}`. It used to be `{body}`: a span name is a low-cardinality grouping key in every backend (Jaeger and Tempo index it, most UIs truncate it around 100-200 characters), so naming a span after the whole log line gives one unique name per span, defeats aggregation and inflates the index. Set `{body}` explicitly if you rely on the old behaviour.
 - An unknown or malformed placeholder (`{message}`, `{truncated:ten:body}`, an unterminated `{`) is a startup error rather than a silent literal.
 - `{severity}` is empty for logs that do not set one, which would leave a dangling separator (`": body"`). When the whole template renders empty (for example `{severity}` alone on a record with no severity), the name falls back to the full body, because OpenTelemetry requires a non-empty span name. Set the severity upstream — the `filelog` receiver or a `transform` processor — if your logs keep it inside the body.
-- The full body always remains available in the `log.body` span attribute, whatever the template renders.
+- The rendered name is additionally capped at `max_span_name_length` runes (default `200`, `0` disables). That is defence in depth: a template built only from literals cannot grow, but any body placeholder can.
+- The body is **not** attached as a `log.body` span attribute unless `include_body_attribute: true`. It used to be unconditional, which sent the body twice on every span — once in the name and once in an attribute — and doubled the payload for a large body. Enable it if a downstream query needs the body and the name is truncated.
+- When the template does not read the body at all (only literals, or only `{severity}`), the connector skips body extraction entirely; when it only needs `{truncated:N:body}`, extraction stops at `N` runes instead of serializing the whole body. For a JSON (Map) body that serialization is the most expensive per-record operation, so this is where most of the CPU saving is.
 - This is deliberately a small template rather than an OTTL expression: OTTL would pull the transform machinery into the connector for the few fields a span name can reasonably use, and the transform processor can already rewrite the body before the connector reads it.
 
 ### Produced spans
@@ -163,11 +174,11 @@ Each flushed group becomes one `ResourceSpans` batch:
 | Resource attributes | The source `ResourceLogs` resource attributes, copied when `copy_resource_attributes` is `true` (the default). When a group holds records from more than one resource, the **first** record's resource is used. `service.name` precedence: an explicit `service_name` wins; otherwise the source `service.name` is preserved; otherwise `logs-to-spans`. See [Scoping groups by resource](#scoping-groups-by-resource). |
 | Scope name | `logs-to-spans` |
 | Trace ID | random, generated when the group is flushed; an incoming trace ID is never adopted, the relationship is recorded as a span link (see [Linking to the originating trace](#linking-to-the-originating-trace)). A group split by `max_logs_per_trace` gets its own trace ID and is linked back to the previous one. |
-| Span name | rendered from [`span_name_template`](#span-naming) — the default `{body}` is the full log body. |
+| Span name | rendered from [`span_name_template`](#span-naming) — the default `{truncated:120:body}`, capped again at `max_span_name_length` runes. |
 | Span kind | `Internal` |
-| Span start | the log's `Timestamp`, falling back to `ObservedTimestamp` when `Timestamp` is unset |
+| Span start | the log's `Timestamp`, falling back to `ObservedTimestamp` when `Timestamp` is unset. When the record carries neither — or carries a timestamp that cannot be represented, such as one written from a zero `time.Time` — the connector stamps the time it processed the record and counts it in `records_without_timestamp`. A missing timestamp never produces a 1970 or 1754 span. |
 | Span end | `start + duration`, where duration is `duration_keys` → time delta to the next log → `end_span_duration` for the last span |
-| Span attributes | `log.body` (always), `log.severity` (only when non-empty), `group.key` |
+| Span attributes | `group.key` always; `log.severity` only when non-empty; `log.body` only when `include_body_attribute: true`. The body is truncated at `max_record_bytes` either way. |
 | Parent | the preceding span in the same trace; the first span has no parent |
 | Links | the span for each log record links to the originating trace/span when the record carried trace context — see [Linking to the originating trace](#linking-to-the-originating-trace). In addition, the first span of a follow-on group links to the last span of the previous group's trace, so a group split by `max_logs_per_trace` stays connected. A span can carry both kinds of link. |
 
@@ -190,8 +201,16 @@ The connector reports its own internal counters through the collector's `MeterPr
 | `otelcol_connector_logs_to_spans_unmatched_dropped` | counter | +1 per log record that matches no `group_by_keys` or `group_by_attributes` entry |
 | `otelcol_connector_logs_to_spans_groups_evicted` | counter | +1 per group flushed early because `max_groups` was reached |
 | `otelcol_connector_logs_to_spans_active_groups` | gauge | number of groups buffered at collection time |
+| `otelcol_connector_logs_to_spans_records_dropped` | counter | +1 per **accepted** record that was then lost before becoming a span, with a `reason` attribute: `downstream_error`, `stopped`, or `shutdown` |
+| `otelcol_connector_logs_to_spans_records_truncated` | counter | +1 per log body truncated at `max_record_bytes` |
+| `otelcol_connector_logs_to_spans_records_without_timestamp` | counter | +1 per record that carried neither a timestamp nor an observed timestamp and was stamped with the time the connector processed it |
+| `otelcol_connector_logs_to_spans_invalid_durations` | counter | +1 per `duration_keys` value that overflowed `time.Duration` or exceeded `max_span_duration` |
 
 `logs_ingested` is the total seen, so `logs_ingested - unmatched_dropped` is the number of records that were grouped, and `traces_created` counts the resulting traces. A rising `unmatched_dropped` means the configured keys do not match the input — see [Key extraction](#key-extraction) and the caveat in [Filtering unmatched logs](#filtering-unmatched-logs).
+
+`records_dropped` is the counter that makes loss visible. The connector returns an error to `ConsumeLogs` whenever it can attribute the failure to that call (a downstream export error, or a connector that is already shut down), so a receiver retries instead of advancing its offsets over lost records; the reaper and shutdown flush have no caller left to return an error to, so there the counter and a `WARN` line are the signal. Non-zero `records_dropped` is always worth alerting on.
+
+The counters are added once per batch, not once per record: the value is a monotonic sum either way, and touching the instrument per record is measurable overhead on a multi-thousand-records-per-second path.
 
 `active_groups` should sit at or below `max_groups`. If it is pinned there, the cap is being hit and `groups_evicted` counts how often; raise `max_groups` or reduce key cardinality. See [Bounding memory with `max_groups`](#bounding-memory-with-max_groups).
 
@@ -207,6 +226,27 @@ service:
                 port: 8888
 ```
 
+## Handling sensitive data and untrusted logs
+
+Log records are **application-controlled input**. Treat everything the connector derives from them as attacker-influenced unless the log source is trusted:
+
+| Surface | Carries | How to bound it |
+|---------|---------|-----------------|
+| Span name | the log body, up to `max_span_name_length` runes | change `span_name_template`, lower `max_span_name_length` |
+| `log.body` attribute | the log body | off by default; `include_body_attribute: false` |
+| `group.key` attribute | the extracted key — often a user, session or request ID | group on a lower-cardinality value, or drop the attribute upstream |
+| Resource attributes | everything the source resource carries (k8s names, host IP, cloud account) | `copy_resource_attributes: false` |
+| Span links | `trace_id_keys` / `span_id_keys` from the record, or record-level trace context | empty the key lists, or `require_span_id: true` |
+| Internal metrics and logs | counts, and `group_key` at `DEBUG` | keep the collector's own telemetry access-controlled |
+
+Practical rules:
+
+- **Bound the memory a producer can pin.** `max_record_bytes` (per record), `max_group_bytes` (per group), `max_groups` (number of groups) and `max_logs_per_trace` (records per trace) are all enforced by default. A single application that logs a megabyte body per line cannot drive the collector to OOM, and with the shipped defaults the worst case is `max_groups × max_group_bytes`, not `max_groups × max_logs_per_trace × body size`.
+- **Do not ship `debug` at `verbosity: detailed`.** It prints every attribute — including group keys and log bodies — to collector stdout, which is usually collected with broader access and longer retention than the trace backend. The shipped examples use `normal`.
+- **TLS.** The example configs use `insecure: true` only against loopback. Any endpoint that leaves the host carries user and session IDs in plaintext unless you enable TLS with verification.
+- **Group keys are not isolated by default.** One pipeline serves every tenant whose logs reach it; without `group_by_resource_attributes`, records from different sources that share an extracted value merge into one trace. See [Scoping groups by resource](#scoping-groups-by-resource).
+- **Report vulnerabilities privately.** See [SECURITY.md](SECURITY.md) — do not open a public issue.
+
 ## Configuration
 
 ### Reference
@@ -218,6 +258,8 @@ service:
 | `timeout` | duration | `5s` | **Inactivity timeout.** Resets every time a new log arrives for a group. When no new logs arrive for this long, the group is flushed and converted to a trace. |
 | `max_wait` | duration | `30s` | **Absolute max wait.** Maximum time from the *first* log in a group before it is force-flushed — regardless of ongoing activity. Prevents groups with continuous log streams from never being emitted. |
 | `max_logs_per_trace` | int | `100` | **Max logs per trace.** Maximum number of log records in a single group/trace. When the limit is reached, the current group is flushed early and a new group starts. Set to `0` for no limit. Traces are connected via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links). |
+| `max_record_bytes` | int | `16384` | **Max retained bytes per log record.** A longer body is truncated, rune-safe, and counted in `records_truncated`. Bounds the memory a single hostile or noisy log line can hold. Set to `0` for no limit. See [Handling sensitive data and untrusted logs](#handling-sensitive-data-and-untrusted-logs). |
+| `max_group_bytes` | int | `4194304` | **Max retained body bytes per group.** A record that would push a group past the bound is preceded by a flush: the group becomes a trace and a linked follow-on group starts, exactly like `max_logs_per_trace`. Records are never dropped for this bound. Must be at least `max_record_bytes` when both are set. Set to `0` for no limit. |
 | `max_groups` | int | `1000` | **Max concurrent groups.** Hard cap on the number of buffered groups. When opening a new group would exceed it, the least recently updated group is flushed early and emitted as a trace before the new group is admitted. Set to `0` for no limit. See [Bounding memory with `max_groups`](#bounding-memory-with-max_groups). |
 | `group_by_keys` | string list | `[]` | Keys to extract from each log body and group by (tried in order). Matched literally, not as regexes. At least one of `group_by_keys` or `group_by_attributes` must be set. See [Key extraction](#key-extraction). |
 | `group_by_attributes` | string list | `[]` | Log attribute names to group by (tried in order). Checked **before** `group_by_keys`; attribute values are stringified. Matched literally, not as regexes. See [Key extraction](#key-extraction). |
@@ -225,12 +267,18 @@ service:
 | `duration_keys` | string list | `[]` | Log attribute names to read an explicit span duration from (tried in order). Accepts Go duration strings, integers (seconds), or floats (seconds). When set, overrides the auto-calculated duration for that span. |
 | `trace_id_keys` | string list | `["trace_id", "trace.id"]` | Log attribute names that hold an originating trace ID, tried in order. Accepts a 32-character hex string or 16 raw bytes. Record-level trace context wins over these attributes. An empty list disables the attribute lookup. See [Linking to the originating trace](#linking-to-the-originating-trace). |
 | `span_id_keys` | string list | `["span_id", "span.id"]` | Log attribute names that hold the originating span ID, tried in order. Accepts a 16-character hex string or 8 raw bytes. Looked up independently of `trace_id_keys`. An empty list disables the attribute lookup. See [Linking to the originating trace](#linking-to-the-originating-trace). |
+| `require_span_id` | bool | `false` | Only emit a span link when both a trace ID and a span ID are present. A record that carries only a trace ID still links by default (with an empty span ID); set this to refuse partial links from an untrusted source. See [Linking to the originating trace](#linking-to-the-originating-trace). |
+| `max_span_duration` | duration | `24h` | Reject an explicit `duration_keys` value larger than this. Without it, an integer attribute above ~292 years overflows `time.Duration` and wraps to a smaller positive value, producing a wrong span end time. Rejected values are counted in `invalid_durations`. Set to `0` for no bound. |
 | `end_span_duration` | duration | `500ms` | Duration assigned to the **last** span in each trace when no explicit duration is available. |
-| `span_name_template` | string | `"{body}"` | Template for the span name. Placeholders: `{body}` (full log body), `{severity}` (severity text), `{truncated:N:body}` (first N characters of the body). Unknown or malformed placeholders are a startup error; an empty render falls back to the body. See [Span naming](#span-naming). |
+| `span_name_template` | string | `"{truncated:120:body}"` | Template for the span name. Placeholders: `{body}` (full log body), `{severity}` (severity text), `{truncated:N:body}` (first N characters of the body). Unknown or malformed placeholders are a startup error; an empty render falls back to the body. See [Span naming](#span-naming). |
+| `include_body_attribute` | bool | `false` | Attach the (truncated) log body as the `log.body` span attribute. Off by default: the body is already available through the span name, and duplicating it on every span doubles the payload. |
+| `max_span_name_length` | int | `200` | Hard cap on the rendered span name, in runes. Defence in depth: a span name is an indexed, low-cardinality field in most backends. `0` disables the cap. |
 
 > **`timeout` vs `max_wait`:** `timeout` is a *sliding* inactivity window — it resets every time a new log arrives. `max_wait` is a *fixed* deadline from the moment the group is created. A group is flushed when *either* deadline passes first.
 
-> **Flush deadlines are checked by one background reaper.** The connector runs a single goroutine that scans buffered groups on a tick — a quarter of the shorter of `timeout` and `max_wait`, clamped to between 10ms and 1s — and flushes those past either deadline. There are no per-group timers, so a group can be emitted up to one tick after its deadline. `max_wait` still caps a group's absolute lifetime, and the reaper is stopped deterministically on `Shutdown`. ([#20](https://github.com/agardnerIT/logs-to-spans-otel/issues/20))
+> **Flush deadlines are checked by one background reaper.** The connector runs a single goroutine that pops buffered groups off a deadline heap on a tick — a quarter of the shorter of `timeout` and `max_wait`, clamped to between 10ms and 1s — and flushes those past either deadline. There are no per-group timers, so a group can be emitted up to one tick after its deadline; `max_wait` still caps a group's absolute lifetime, and the reaper is stopped deterministically on `Shutdown`. ([#20](https://github.com/agardnerIT/logs-to-spans-otel/issues/20))
+
+> **Exports are batched and never run on the reaper.** Expired groups are handed to a small pool of export workers, and the groups retired by one tick, one `ConsumeLogs` call or one shutdown flush travel in a single downstream call (one `ResourceSpans` per group, up to 100 groups per call). A slow exporter therefore cannot stop deadlines from being enforced, and shutdown cost does not scale with the number of buffered groups. Every downstream call has its own timeout and every shutdown wait is bounded; a call that overruns is reported as an error rather than hanging the collector.
 
 ### Bounding memory with `max_groups`
 
@@ -241,6 +289,13 @@ When a log record opens a group and the map already holds `max_groups` groups, t
 Eviction happens only when a **new** key is opened. Adding records to a group that is already buffered never evicts it, so a hot key is never split by the cap.
 
 Set `max_groups: 0` to disable the cap — the same convention as `max_logs_per_trace: 0`. It is not recommended for keys you do not control: memory then grows with the number of distinct keys until each group times out. `max_wait` is already the per-group TTL, so there is no separate TTL option.
+
+`max_groups` bounds the number of groups but not their size, so two byte bounds complete the picture:
+
+- `max_record_bytes` (default 16 KiB) truncates one oversized body, rune-safe, and counts it in `records_truncated`.
+- `max_group_bytes` (default 4 MiB) flushes a group that would grow past it and starts a linked follow-on group, the same way `max_logs_per_trace` does. No record is dropped.
+
+With the defaults the connector retains at most about `max_groups × max_group_bytes` of body text (4 GiB at the shipped defaults), and a single producer can no longer make that unbounded. `Config.Validate` also rejects absurd combinations (for example `max_groups × max_logs_per_trace` above ten million buffered records) at startup rather than at OOM.
 
 Use the `groups_evicted` counter and `active_groups` gauge (see [Produced metrics](#produced-metrics)) to see the cap working. Eviction reads the tail of an LRU list, so it never scans the map.
 
@@ -386,7 +441,7 @@ Add this connector to your OCB `builder-config.yaml`:
 
 ```yaml
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.6.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.7.0"
     name: "logs_to_spans"
 
 exporters:
@@ -454,6 +509,15 @@ The test suite covers:
 - Unmatched records being dropped without creating a trace
 - Concurrent consumption during `max_logs_per_trace` splits and reaper flushes (run under `-race`)
 - Eager extraction: mutating a source log record after `ConsumeLogs` returns does not change the emitted span
+- Missing, zero and wrapped timestamps, plus the `records_without_timestamp` counter
+- Duration overflow (integer, double and string forms), `max_span_duration`, and the `invalid_durations` counter
+- `max_record_bytes` truncation, `max_group_bytes` splitting, and the `records_truncated` counter
+- Downstream export failures surfacing as an error from `ConsumeLogs` and as `records_dropped{reason=downstream_error}`, the stopped-connector path, and a shutdown flush with an already-cancelled context
+- Shutdown batching several groups into one downstream call, and a bounded shutdown when the exporter is wedged
+- The reaper continuing to enforce deadlines while an export is blocked
+- One metric measurement per batch rather than per record
+- Nothing emitted at `INFO` per trace, and group keys not leaking into collector logs
+- The shipped example configs (no `verbosity: detailed`, `insecure: true` only on loopback, digest-pinned Dockerfile, quickstart building the working tree) and the repo's security/CI/dependency-scanning files
 
 ### Lint
 
@@ -478,6 +542,10 @@ go test -run '^$' -bench . -benchmem ./...
 - `BenchmarkConsumeLogsStructuredParallel` — concurrent callers against one connector, with `max_logs_per_trace` disabled so the measurement is the group-map path alone. This is the case the global mutex used to serialise ([#15](https://github.com/agardnerIT/logs-to-spans-otel/issues/15), [#20](https://github.com/agardnerIT/logs-to-spans-otel/issues/20)).
 - `BenchmarkConsumeLogsStructuredParallelSplits` — the same parallel workload with `max_logs_per_trace: 1000`, so each split also builds and emits a trace. That trace construction, not the connector lock, dominates the allocation profile and the 8-core number.
 - `BenchmarkExtractLogRecord` — the extraction the fix moved out of the critical section, measured on its own
+- `BenchmarkConsumeLogsSingleGroup` — one group key per scope, the steady state; the grouping path must not allocate a per-scope map there
+- `BenchmarkReapExpiredManyGroups` — a reaper tick with 1000 live groups and nothing expired, the cost the deadline heap removed
+
+Benchmarks also run in CI (`go test -run '^$' -bench . -benchtime 50x -benchmem`), so the numbers exist in the build history instead of only on a maintainer's laptop, and `TestExtractLogRecordAllocationBudget` fails the suite if per-record allocation roughly doubles.
 
 ### Quick start with filelog
 
@@ -489,16 +557,22 @@ ocb --config builder-config.yaml
 ./otelcol-dist/otelcol-logs-to-spans --config collector.yaml
 ```
 
-The included `collector.yaml` and `input.log` let you exercise the full pipeline immediately. Spans appear in the debug exporter output and, if Jaeger is running on `127.0.0.1:4317`, in Jaeger UI at `localhost:16686`.
+The included `collector.yaml` and `examples/plaintext/input.log` let you exercise the full pipeline immediately. Spans appear in the debug exporter output and, if Jaeger is running on `127.0.0.1:4317`, in Jaeger UI at `localhost:16686`.
 
 ## Project structure
 
 ```
 .
+├── .github/
+│   ├── dependabot.yml           # gomod / actions / docker updates
+│   └── workflows/
+│       ├── ci.yaml              # lint, govulncheck, vet, tests, benchmarks, OCB build, config validation
+│       └── dependency-review.yaml
 ├── .golangci.yml                # Lint config (mirrors contrib's)
 ├── LICENSE                      # Apache 2.0
 ├── Makefile                     # includes contrib Makefile.Common at donation time
 ├── README.md
+├── SECURITY.md                  # Private vulnerability disclosure route
 ├── builder-config.yaml          # OCB manifest
 ├── collector.yaml               # Example collector config
 ├── config.go                    # Config struct and defaults
@@ -506,24 +580,74 @@ The included `collector.yaml` and `input.log` let you exercise the full pipeline
 ├── config_test.go               # testdata/config.yaml round-trip
 ├── connector.go                 # Core implementation
 ├── connector_test.go
+├── examples_test.go             # Guards on the shipped example/hygiene files
+├── export_test.go               # Error propagation, batching, reaper and shutdown bounds
+├── limits_test.go               # Size/duration/timestamp bounds and allocation budget
 ├── doc.go                       # Package documentation
 ├── documentation.md             # Generated internal-telemetry docs (mdatagen)
 ├── examples/
+│   ├── plaintext/input.log      # Sample log for collector.yaml
 │   └── quickstart/              # Docker quickstart: sample log, OCB manifest, config (transform rebase + debug + otlp_http to Jaeger)
 ├── factory.go                   # OTEL connector factory
 ├── generated_component_test.go  # Generated lifecycle test (mdatagen)
 ├── generated_package_test.go    # Generated goleak TestMain (mdatagen)
 ├── go.mod / go.sum
-├── input.log                    # Sample log file for testing
 ├── internal/
 │   ├── metadata/                # Generated status + telemetry builder (mdatagen)
 │   └── metadatatest/            # Generated telemetry test helpers (mdatagen)
 ├── metadata.yaml                # Component metadata, source for mdatagen
+├── span_name.go / span_name_test.go  # span_name_template parsing and rendering
 ├── telemetry.go                 # Wires the generated TelemetryBuilder
 └── testdata/config.yaml         # Sample configs used by config_test.go
 ```
 
 ## Changelog
+
+### v0.7.0
+
+Security, correctness and performance pass over the whole conversion path. Several defaults change; each is called out below.
+
+**Behaviour changes**
+
+- The default `span_name_template` is now `{truncated:120:body}` instead of `{body}`, and the rendered name is capped at `max_span_name_length` runes (default `200`). Naming every span after the whole log line produced one unique name per span, which defeats aggregation and inflates every backend's index. Set `span_name_template: "{body}"` to get the old names back. ([#27](https://github.com/agardnerIT/logs-to-spans-otel/issues/27))
+- `log.body` is no longer attached to every span; it is opt-in with `include_body_attribute: true`. The body was being sent twice per span — once in the name and once in an attribute. ([#27](https://github.com/agardnerIT/logs-to-spans-otel/issues/27))
+- `ConsumeLogs` now returns an error when records it accepted could not become spans (a downstream export failure, or a connector that is already shut down), instead of always returning `nil` and letting the receiver advance its offsets over lost data. ([#24](https://github.com/agardnerIT/logs-to-spans-otel/issues/24))
+- New options: `max_record_bytes` (default 16 KiB), `max_group_bytes` (default 4 MiB), `max_span_duration` (default 24h), `max_span_name_length` (default 200), `include_body_attribute` (default false) and `require_span_id` (default false).
+
+**Security**
+
+- Bounded the memory a log producer can pin ([#22](https://github.com/agardnerIT/logs-to-spans-otel/issues/22)): bodies are truncated at `max_record_bytes` (rune-safe, counted in `records_truncated`), groups are split at `max_group_bytes` exactly like `max_logs_per_trace` (no records dropped), and `Config.Validate` rejects configurations whose `max_groups × max_logs_per_trace` would buffer more than ten million records. Previously nothing bounded the *bytes*, so `max_groups × max_logs_per_trace × body size` was the retention worst case.
+- Documented the trace-link trust boundary and added `require_span_id` ([#42](https://github.com/agardnerIT/logs-to-spans-otel/issues/42)): `trace_id_keys` / `span_id_keys` are application-controlled, validated for format only. Emptying the lists leaves only record-level trace context, and `require_span_id: true` refuses a trace-ID-only link.
+- Trace and span IDs no longer come from a discarded `crypto/rand.Read` error ([#39](https://github.com/agardnerIT/logs-to-spans-otel/issues/39)). The generator is a `math/rand/v2.ChaCha8` seeded once from `crypto/rand`; a failed seed fails component creation instead of emitting all-zero IDs that every backend drops.
+- Both shipped example configs use the debug exporter at `verbosity: normal`, not `detailed`, which was dumping full log bodies, group keys and resource attributes to container stdout ([#40](https://github.com/agardnerIT/logs-to-spans-otel/issues/40)).
+- TLS in the examples is now explicitly loopback-only, with a commented certificate block and an `https://` cross-host override instead of a documented plaintext hop ([#41](https://github.com/agardnerIT/logs-to-spans-otel/issues/41)). A new README section, [Handling sensitive data and untrusted logs](#handling-sensitive-data-and-untrusted-logs), lists every surface a record controls.
+- Added [`SECURITY.md`](SECURITY.md) with a private GitHub advisory route, response targets and an explicit trust-boundary summary ([#36](https://github.com/agardnerIT/logs-to-spans-otel/issues/36)).
+- CI now declares `permissions: contents: read` and pins every action to a commit SHA, with the version in a comment ([#37](https://github.com/agardnerIT/logs-to-spans-otel/issues/37)).
+- Added a `govulncheck` job, Dependabot for `gomod` (root and `otelcol-dist`), `github-actions` and `docker`, and a `dependency-review` workflow ([#46](https://github.com/agardnerIT/logs-to-spans-otel/issues/46)). Re-triaged the gosec exclusions: `G118` (goroutine/context lifetime) and `G706` (log injection) are enabled again — the reaper/worker rewrite in this release is exactly what `G118` targets — and every remaining exclusion is documented with why it cannot fire here.
+- The quickstart `Dockerfile` pins both base images by digest, sets `GOTOOLCHAIN=local` and `GOFLAGS=-mod=readonly`, and builds the connector from the working tree instead of the last published module ([#43](https://github.com/agardnerIT/logs-to-spans-otel/issues/43)). Its build context is now the repository root: `docker build -f examples/quickstart/Dockerfile .`.
+
+**Correctness**
+
+- Fixed spans dated 1754 (or 1970) for records with no usable timestamp ([#25](https://github.com/agardnerIT/logs-to-spans-otel/issues/25)). A record with neither `Timestamp` nor `ObservedTimestamp`, or with a timestamp written from a zero `time.Time` (a negative `UnixNano` stored as a `uint64`), is now stamped with the time the connector processed it and counted in `records_without_timestamp`.
+- Fixed `duration_keys` overflow ([#44](https://github.com/agardnerIT/logs-to-spans-otel/issues/44)). Integer and double values above what `time.Duration` can hold were wrapping to a small positive value and silently producing a nonsense span end time; they are now rejected, the next configured key is tried, and the rejection is counted in `invalid_durations`. `max_span_duration` bounds the rest.
+
+**Reliability and performance**
+
+- The reaper no longer performs downstream exports itself ([#26](https://github.com/agardnerIT/logs-to-spans-otel/issues/26)). Expired groups are handed to a small export worker pool, every downstream call derives a bounded context, `Shutdown` stops the reaper and drains the queue, and every shutdown wait is bounded — a wedged exporter produces an error instead of hanging the collector.
+- Shutdown emits one batched downstream call for all buffered groups (chunked at 100 groups) instead of one per group ([#34](https://github.com/agardnerIT/logs-to-spans-otel/issues/34)), and the ingest path batches the groups a single batch retired.
+- The reaper pops a deadline min-heap instead of scanning every group under the global mutex ([#30](https://github.com/agardnerIT/logs-to-spans-otel/issues/30)): a tick with 1000 live groups and nothing expired costs ~165 ns and zero allocations, versus a full scan. `BenchmarkReapExpiredManyGroups` pins it.
+- Resource attributes are no longer deep-copied per batch and discarded ([#23](https://github.com/agardnerIT/logs-to-spans-otel/issues/23)): the copy happens only when a new group is created and only when `copy_resource_attributes` is on.
+- `ConsumeLogs` groups a scope's records into a small slice instead of a map per scope ([#33](https://github.com/agardnerIT/logs-to-spans-otel/issues/33)); `logs_ingested` and `unmatched_dropped` are added once per batch instead of once per record ([#28](https://github.com/agardnerIT/logs-to-spans-otel/issues/28)).
+- Span IDs are drawn in bulk: one ChaCha8 read per exported batch instead of one `crypto/rand.Read` per span ([#31](https://github.com/agardnerIT/logs-to-spans-otel/issues/31)).
+- Body serialization is skipped when the template cannot read it, and bounded at the template's truncation length when it only needs a prefix ([#32](https://github.com/agardnerIT/logs-to-spans-otel/issues/32)). For a JSON (Map) body — the expensive case — a `{truncated:N:body}` template no longer materializes the whole JSON string.
+- The per-trace `converted log group to trace` line is `DEBUG`, not `INFO` ([#29](https://github.com/agardnerIT/logs-to-spans-otel/issues/29)), so a busy connector does not flood the shared logging pipeline or leak group keys at a default-on level.
+- The per-group sort uses `slices.SortStableFunc` behind an `IsSortedFunc` pre-check instead of reflection-based `sort.SliceStable` ([#35](https://github.com/agardnerIT/logs-to-spans-otel/issues/35)).
+- Benchmarks now run in CI, `TestExtractLogRecordAllocationBudget` guards per-record allocation, and a dead `Map` branch in `valueToString` is gone ([#38](https://github.com/agardnerIT/logs-to-spans-otel/issues/38)). New `BenchmarkConsumeLogsSingleGroup` and `BenchmarkReapExpiredManyGroups`.
+
+**Repository hygiene**
+
+- Deleted the internal planning document `fix-order.txt` and moved the sample log to `examples/plaintext/input.log`; the project structure section of this README now says what is source, what is generated and what is example data ([#45](https://github.com/agardnerIT/logs-to-spans-otel/issues/45)).
+- New metrics: `records_dropped` (with a `reason` attribute), `records_truncated`, `records_without_timestamp` and `invalid_durations`.
 
 ### v0.6.0
 

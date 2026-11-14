@@ -25,7 +25,11 @@ func TestSetupTelemetry(t *testing.T) {
 		return nil
 	}))
 	tb.ConnectorLogsToSpansGroupsEvicted.Add(context.Background(), 1)
+	tb.ConnectorLogsToSpansInvalidDurations.Add(context.Background(), 1)
 	tb.ConnectorLogsToSpansLogsIngested.Add(context.Background(), 1)
+	tb.ConnectorLogsToSpansRecordsDropped.Add(context.Background(), 1)
+	tb.ConnectorLogsToSpansRecordsTruncated.Add(context.Background(), 1)
+	tb.ConnectorLogsToSpansRecordsWithoutTimestamp.Add(context.Background(), 1)
 	tb.ConnectorLogsToSpansTracesCreated.Add(context.Background(), 1)
 	tb.ConnectorLogsToSpansUnmatchedDropped.Add(context.Background(), 1)
 	AssertEqualConnectorLogsToSpansActiveGroups(t, testTel,
@@ -34,7 +38,19 @@ func TestSetupTelemetry(t *testing.T) {
 	AssertEqualConnectorLogsToSpansGroupsEvicted(t, testTel,
 		[]metricdata.DataPoint[int64]{{Value: 1}},
 		metricdatatest.IgnoreTimestamp())
+	AssertEqualConnectorLogsToSpansInvalidDurations(t, testTel,
+		[]metricdata.DataPoint[int64]{{Value: 1}},
+		metricdatatest.IgnoreTimestamp())
 	AssertEqualConnectorLogsToSpansLogsIngested(t, testTel,
+		[]metricdata.DataPoint[int64]{{Value: 1}},
+		metricdatatest.IgnoreTimestamp())
+	AssertEqualConnectorLogsToSpansRecordsDropped(t, testTel,
+		[]metricdata.DataPoint[int64]{{Value: 1}},
+		metricdatatest.IgnoreTimestamp())
+	AssertEqualConnectorLogsToSpansRecordsTruncated(t, testTel,
+		[]metricdata.DataPoint[int64]{{Value: 1}},
+		metricdatatest.IgnoreTimestamp())
+	AssertEqualConnectorLogsToSpansRecordsWithoutTimestamp(t, testTel,
 		[]metricdata.DataPoint[int64]{{Value: 1}},
 		metricdatatest.IgnoreTimestamp())
 	AssertEqualConnectorLogsToSpansTracesCreated(t, testTel,

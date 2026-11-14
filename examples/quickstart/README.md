@@ -33,10 +33,11 @@ The image builds the collector with OCB, so no local Go toolchain is needed.
 From this directory:
 
 ```sh
-docker build -t logs-to-spans-quickstart .
+# from the repository root: the image builds the connector from this checkout
+docker build -f examples/quickstart/Dockerfile -t logs-to-spans-quickstart .
 docker run --rm \
   --add-host=host.docker.internal:host-gateway \
-  -e OTLP_HTTP_ENDPOINT=http://host.docker.internal:4318 \
+  -e OTLP_HTTP_ENDPOINT=https://host.docker.internal:4318 \
   logs-to-spans-quickstart
 ```
 
@@ -44,9 +45,16 @@ The collector container reaches the Jaeger container through the host, hence
 the endpoint override (see below). `--add-host` makes `host.docker.internal`
 resolve on Linux; Docker Desktop provides it already.
 
-`collector.yaml`, `manifest.yaml` and `app.log` are copied into the image at
-build time, so `docker build` again after editing any of them — a running
-container keeps the config it was built with. If traces do not appear, check
+`collector.yaml` and `app.log` are copied into the image at build time, and the
+connector source comes from the checkout via `manifest.yaml`'s `replaces` entry,
+so `docker build` again after editing anything — a running container keeps the
+code and config it was built with.
+
+> **Plaintext vs TLS.** The default endpoint is loopback (`127.0.0.1`) and the
+> config sets `insecure: true` for it. The override above points at the host
+> from inside a container, which is *not* loopback, so it uses `https://` —
+> point `ca_file` at your certificate (see the commented block in
+> `collector.yaml`) or use `--network host` on Linux to keep the hop local. If traces do not appear, check
 what the container actually loaded before suspecting Jaeger:
 
 ```sh
@@ -63,9 +71,11 @@ ocb --config manifest.yaml
 ./otelcol-dist/otelcol-logs-to-spans-quickstart --config collector.yaml
 ```
 
-The collector builds with OCB v0.162.0 and the published `v0.6.0` connector.
-To use local connector changes, add a `replaces` entry pointing at this
-repository, as shown in the root [`builder-config.yaml`](../../builder-config.yaml).
+The collector builds with OCB v0.162.0. `manifest.yaml` contains a `replaces`
+entry pointing at this repository, so it builds the **working tree**, not the
+published `v0.7.0` tag: a change to `connector.go` shows up in the example
+without a release. The same pattern (and the note on how `replaces` paths are
+resolved) is in the root [`builder-config.yaml`](../../builder-config.yaml).
 
 Either way, three traces appear in the debug output after the 2s timeout and in
 Jaeger. Press Ctrl+C to stop the collector. If Jaeger is not running the debug

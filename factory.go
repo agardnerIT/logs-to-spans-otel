@@ -60,7 +60,21 @@ func createLogsToTraces(
 		lru:            list.New(),
 		compiledRegex:  compiledRegex,
 		spanName:       spanName,
+		extractOpts:    extractOptionsFor(c, spanName),
+		exportTimeout:  exportTimeoutDefault,
+		shutdownWait:   shutdownWaitTimeout,
+		exportCh:       make(chan exportBatch, exportQueueSize),
 	}
+
+	// Trace and span IDs come from a ChaCha8 generator seeded once from
+	// crypto/rand. Failing here means the process has no usable entropy source,
+	// which is a startup failure: running with a zero or predictable seed would
+	// emit invalid or colliding IDs that backends silently drop.
+	ids, err := newIDGenerator()
+	if err != nil {
+		return nil, err
+	}
+	conn.ids = ids
 
 	telemetry, err := newTelemetry(set.TelemetrySettings, conn.activeGroupCount)
 	if err != nil {

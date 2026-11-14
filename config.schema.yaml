@@ -5,7 +5,7 @@ properties:
     description: CopyResourceAttributes copies the source logs' resource attributes onto the resource of every emitted trace. When a group contains records from more than one resource, the first record's resource is used. Set to false to emit only service.name.
     type: boolean
   duration_keys:
-    description: DurationKeys is the ordered list of attribute names that hold an explicit span duration.
+    description: DurationKeys is the ordered list of attribute names that hold an explicit span duration, as a number of seconds or a Go duration string. Values that cannot be represented, or that exceed MaxSpanDuration, are ignored and counted by otelcol_connector_logs_to_spans_invalid_durations.
     type: array
     items:
       type: string
@@ -27,31 +27,49 @@ properties:
     type: array
     items:
       type: string
+  include_body_attribute:
+    description: 'IncludeBodyAttribute attaches the log body as the log.body span attribute. It is off by default: the body is already available through SpanNameTemplate, and duplicating it on every span doubles the payload.'
+    type: boolean
+  max_group_bytes:
+    description: MaxGroupBytes bounds the retained body bytes of one group. When a record would push a group past the bound, the group is flushed as a trace and a follow-on group starts with a span link back to it, exactly as max_logs_per_trace does. Records are never dropped for this bound. 0 disables it.
+    type: integer
   max_groups:
     description: MaxGroups bounds the number of buffered groups. When a new group would exceed it, the least recently updated group is flushed early. 0 disables the bound.
     type: integer
   max_logs_per_trace:
     description: MaxLogsPerTrace caps the number of log records in one trace. When a group reaches the cap it is flushed as a trace and a follow-on group starts with a span link back to it. 0 disables the cap.
     type: integer
+  max_record_bytes:
+    description: MaxRecordBytes bounds the retained size of one buffered log record. A longer body is truncated, rune-safe, so a single huge log line cannot be retained in full. Truncation is counted by otelcol_connector_logs_to_spans_records_truncated. 0 disables the bound.
+    type: integer
+  max_span_duration:
+    description: MaxSpanDuration rejects an explicit duration larger than this, which is otherwise either nonsense or an overflow of time.Duration. 0 disables the bound.
+    x-customType: time.duration
+  max_span_name_length:
+    description: MaxSpanNameLength caps the rendered span name, counted in runes. Span names are low-cardinality grouping keys in most backends, so an unbounded name (a raw log line, say) defeats aggregation and inflates every index. 0 disables the cap.
+    type: integer
   max_wait:
     description: MaxWait is the maximum time a group may stay open, measured from its first log record, regardless of later activity.
     x-customType: time.duration
+  require_span_id:
+    description: RequireSpanID makes a span link conditional on both a trace ID and a span ID being present. By default a record that carries only a trace ID still links, with a zero span ID. Requiring the pair means a forged or partial link cannot be emitted, at the cost of dropping links for producers that only know the trace ID.
+    type: boolean
   service_name:
     description: ServiceName overrides the service.name resource attribute of every emitted trace. When empty, the source logs' service.name is preserved and "logs-to-spans" is used when the source has none.
     type: string
   span_id_keys:
-    description: SpanIDKeys is the ordered list of attribute names that hold the originating span ID, as a 16-character hex string or 8 raw bytes. It is looked up independently of TraceIDKeys, so a record-level trace ID can be paired with a span ID from an attribute. An empty list disables the attribute lookup.
+    description: SpanIDKeys is the ordered list of attribute names that hold the originating span ID, as a 16-character hex string or 8 raw bytes. It is looked up independently of TraceIDKeys, so a record-level trace ID can be paired with a span ID from an attribute. An empty list disables the attribute lookup. See TraceIDKeys for the trust boundary.
     type: array
     items:
       type: string
   span_name_template:
-    description: 'SpanNameTemplate controls the name of every generated span. It is literal text with three placeholders: {body} (the full log body, the default), {severity} (the log record''s severity text) and {truncated:N:body} (the first N characters of the body). An unknown placeholder is a startup error. A template that renders to an empty string falls back to the full body, so a span name is never empty.'
+    description: 'SpanNameTemplate controls the name of every generated span. It is literal text with three placeholders: {body} (the full log body), {severity} (the log record''s severity text) and {truncated:N:body} (the first N characters of the body, the default). An unknown placeholder is a startup error. A template that renders to an empty string falls back to the log body, so a span name is never empty. The rendered name is capped at MaxSpanNameLength runes.'
     type: string
   timeout:
     description: Timeout is the inactivity period after which a group is flushed. Each new log record in a group resets it.
     x-customType: time.duration
   trace_id_keys:
-    description: TraceIDKeys is the ordered list of attribute names that hold an originating trace ID, as a 32-character hex string or 16 raw bytes. When a log record carries one, the span generated from it links back to that trace. Record-level trace context (set by a receiver or trace_parser operator) takes precedence over these attributes. An empty list disables the attribute lookup.
+    description: 'TraceIDKeys is the ordered list of attribute names that hold an originating trace ID, as a 32-character hex string or 16 raw bytes. When a log record carries one, the span generated from it links back to that trace. Record-level trace context (set by a receiver or trace_parser operator) takes precedence over these attributes. An empty list disables the attribute lookup. Trust boundary: an attribute is written by whoever produced the log line, so these IDs are attacker-influenced whenever the log source is not fully trusted. The connector validates the format of an ID, never its provenance; a producer can therefore make its spans link to an arbitrary trace. Set TraceIDKeys/SpanIDKeys to an empty list (and rely on record-level trace context, which only a receiver or a collector-side operator can set) when the log source is not trusted, or use GroupByResourceAttributes to keep tenants apart.'
     type: array
     items:
       type: string

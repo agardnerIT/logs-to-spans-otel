@@ -22,9 +22,47 @@ Number of groups flushed early because max_groups was reached.
 | ---- | ----------- | ---------- | --------- | --------- |
 | {group} | Sum | Int | true | Development |
 
+### otelcol_connector_logs_to_spans_invalid_durations
+
+Number of duration_keys values rejected because they overflowed or exceeded max_span_duration.
+
+| Unit | Metric Type | Value Type | Monotonic | Stability |
+| ---- | ----------- | ---------- | --------- | --------- |
+| {log_record} | Sum | Int | true | Development |
+
 ### otelcol_connector_logs_to_spans_logs_ingested
 
 Number of log records consumed by the connector.
+
+| Unit | Metric Type | Value Type | Monotonic | Stability |
+| ---- | ----------- | ---------- | --------- | --------- |
+| {log_record} | Sum | Int | true | Development |
+
+### otelcol_connector_logs_to_spans_records_dropped
+
+Number of accepted log records dropped before being emitted as spans, by reason.
+
+| Unit | Metric Type | Value Type | Monotonic | Stability |
+| ---- | ----------- | ---------- | --------- | --------- |
+| {log_record} | Sum | Int | true | Development |
+
+#### Attributes
+
+| Name | Description | Values | Semantic Convention |
+| ---- | ----------- | ------ | ------------------- |
+| reason | Why the record was dropped after the connector had already accepted it. | Str: ``stopped``, ``downstream_error``, ``shutdown`` | - |
+
+### otelcol_connector_logs_to_spans_records_truncated
+
+Number of log bodies truncated at max_record_bytes.
+
+| Unit | Metric Type | Value Type | Monotonic | Stability |
+| ---- | ----------- | ---------- | --------- | --------- |
+| {log_record} | Sum | Int | true | Development |
+
+### otelcol_connector_logs_to_spans_records_without_timestamp
+
+Number of log records that carried neither a timestamp nor an observed timestamp and were stamped with the time the connector processed them.
 
 | Unit | Metric Type | Value Type | Monotonic | Stability |
 | ---- | ----------- | ---------- | --------- | --------- |

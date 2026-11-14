@@ -4,6 +4,7 @@
 package logs_to_spans
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -181,6 +182,70 @@ func BenchmarkExtractLogRecord(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = extractLogRecord(lr, cfg)
+		_ = extractLogRecord(lr, cfg, extractOptionsFor(cfg, mustCompileTemplate(b, cfg.SpanNameTemplate)))
+	}
+}
+
+// mustCompileTemplate compiles a span name template for the benchmarks.
+func mustCompileTemplate(tb testing.TB, tmpl string) *spanNameTemplate {
+	tb.Helper()
+	compiled, err := compileSpanNameTemplate(tmpl)
+	require.NoError(tb, err)
+	return compiled
+}
+
+// BenchmarkConsumeLogsSingleGroup pins the single-group fast path from #33:
+// one key per scope, which is the steady state this connector is built for.
+// The grouping path must not allocate a map per scope in that case.
+func BenchmarkConsumeLogsSingleGroup(b *testing.B) {
+	conn := newBenchmarkConnector(b, 0)
+	defer func() {
+		drainBenchmarkGroups(conn)
+		require.NoError(b, conn.Shutdown(b.Context()))
+	}()
+
+	ld := plog.NewLogs()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	for i := range benchBatchSize {
+		lr := sl.LogRecords().AppendEmpty()
+		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Unix(0, int64(i))))
+		lr.Body().SetStr("user=u-1234 request completed")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		require.NoError(b, conn.ConsumeLogs(b.Context(), ld))
+	}
+	b.ReportMetric(float64(b.N*benchBatchSize)/b.Elapsed().Seconds(), "logs/sec")
+}
+
+// BenchmarkReapExpiredManyGroups measures the reaper tick from #30 with the
+// maximum group count and a short timeout: 1000 live groups, none (or almost
+// none) expired. Before the deadline heap this was a full O(groups) scan under
+// the connector mutex on every tick; now it is one comparison.
+func BenchmarkReapExpiredManyGroups(b *testing.B) {
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	cfg.MaxGroups = 0
+	cfg.Timeout = time.Hour
+	cfg.MaxWait = time.Hour
+
+	conn, err := NewFactory().CreateLogsToTraces(b.Context(), newTestSettings(), cfg, consumertest.NewNop())
+	require.NoError(b, err)
+	defer func() {
+		drainBenchmarkGroups(conn.(*logsToSpansConnector))
+		require.NoError(b, conn.Shutdown(b.Context()))
+	}()
+	raw := conn.(*logsToSpansConnector)
+
+	for i := range 1000 {
+		addTestRecord(raw, "key-"+strconv.Itoa(i), newLogRecord("user=x body", time.Now(), "INFO"))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		raw.reapExpired()
 	}
 }

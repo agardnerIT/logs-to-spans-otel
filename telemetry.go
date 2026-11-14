@@ -18,11 +18,15 @@ import (
 // each generated name with otelcol_); the README "Produced metrics" table and
 // the tests document exactly these.
 const (
-	metricLogsIngested     = "otelcol_connector_logs_to_spans_logs_ingested"
-	metricTracesCreated    = "otelcol_connector_logs_to_spans_traces_created"
-	metricUnmatchedDropped = "otelcol_connector_logs_to_spans_unmatched_dropped"
-	metricGroupsEvicted    = "otelcol_connector_logs_to_spans_groups_evicted"
-	metricActiveGroups     = "otelcol_connector_logs_to_spans_active_groups"
+	metricLogsIngested       = "otelcol_connector_logs_to_spans_logs_ingested"
+	metricTracesCreated      = "otelcol_connector_logs_to_spans_traces_created"
+	metricUnmatchedDropped   = "otelcol_connector_logs_to_spans_unmatched_dropped"
+	metricGroupsEvicted      = "otelcol_connector_logs_to_spans_groups_evicted"
+	metricActiveGroups       = "otelcol_connector_logs_to_spans_active_groups"
+	metricRecordsDropped     = "otelcol_connector_logs_to_spans_records_dropped"
+	metricRecordsTruncated   = "otelcol_connector_logs_to_spans_records_truncated"
+	metricRecordsWithoutTime = "otelcol_connector_logs_to_spans_records_without_timestamp"
+	metricInvalidDurations   = "otelcol_connector_logs_to_spans_invalid_durations"
 )
 
 // newTelemetry builds the connector's internal instruments from the

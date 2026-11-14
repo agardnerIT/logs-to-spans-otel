@@ -12,10 +12,12 @@ status:
   distributions: [contrib]
   codeowners:
     active: [agardnerIT]
-    # TODO(donation): a donation needs a sponsor (approver/maintainer from a
-    # different company) and three codeowners, at least one of whom is an
-    # approver/maintainer. Replace this list with the confirmed handles before
-    # opening the contrib pull request.
+
+attributes:
+  reason:
+    description: Why the record was dropped after the connector had already accepted it.
+    type: string
+    enum: [stopped, downstream_error, shutdown]
 
 tests:
   config:
@@ -23,15 +25,22 @@ tests:
     max_wait: 30s
     max_logs_per_trace: 100
     max_groups: 1000
+    max_record_bytes: 16384
+    max_group_bytes: 4194304
     group_by_keys: [userID]
+    group_by_attributes: [user.id]
     group_by_resource_attributes: [service.name]
     duration_keys: [duration]
     trace_id_keys: [trace_id]
     span_id_keys: [span_id]
+    require_span_id: false
     end_span_duration: 500ms
+    max_span_duration: 24h
     copy_resource_attributes: true
     service_name: test-service
-    span_name_template: "{body}"
+    span_name_template: "{severity}: {truncated:120:body}"
+    include_body_attribute: false
+    max_span_name_length: 200
 
 telemetry:
   metrics:
@@ -51,9 +60,42 @@ telemetry:
         value_type: int
         monotonic: true
       stability: development
+    connector_logs_to_spans_invalid_durations:
+      enabled: true
+      description: Number of duration_keys values rejected because they overflowed or exceeded max_span_duration.
+      unit: "{log_record}"
+      sum:
+        value_type: int
+        monotonic: true
+      stability: development
     connector_logs_to_spans_logs_ingested:
       enabled: true
       description: Number of log records consumed by the connector.
+      unit: "{log_record}"
+      sum:
+        value_type: int
+        monotonic: true
+      stability: development
+    connector_logs_to_spans_records_dropped:
+      enabled: true
+      description: Number of accepted log records dropped before being emitted as spans, by reason.
+      unit: "{log_record}"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [reason]
+      stability: development
+    connector_logs_to_spans_records_truncated:
+      enabled: true
+      description: Number of log bodies truncated at max_record_bytes.
+      unit: "{log_record}"
+      sum:
+        value_type: int
+        monotonic: true
+      stability: development
+    connector_logs_to_spans_records_without_timestamp:
+      enabled: true
+      description: Number of log records that carried neither a timestamp nor an observed timestamp and were stamped with the time the connector processed them.
       unit: "{log_record}"
       sum:
         value_type: int
