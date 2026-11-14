@@ -16,7 +16,7 @@ ENV GOTOOLCHAIN=local \
     CGO_ENABLED=0
 
 WORKDIR /build
-RUN go install go.opentelemetry.io/collector/cmd/builder@v0.162.0
+RUN go install go.opentelemetry.io/collector/cmd/builder@v0.165.0
 
 # The connector source. manifest.yaml replaces the module with this tree.
 COPY go.mod go.sum ./

@@ -9,7 +9,8 @@ the collector's support window.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.7.x   | Yes       |
+| 0.8.x   | Yes       |
+| 0.7.x   | No        |
 | 0.6.x   | No        |
 | < 0.6   | No        |
 

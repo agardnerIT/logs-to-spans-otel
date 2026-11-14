@@ -441,25 +441,25 @@ Add this connector to your OCB `builder-config.yaml`:
 
 ```yaml
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.7.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.8.0"
     name: "logs_to_spans"
 
 exporters:
-  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.162.0"
-  - gomod: "go.opentelemetry.io/collector/exporter/otlpexporter v0.162.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.165.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/otlpexporter v0.165.0"
 
 receivers:
-  - gomod: "go.opentelemetry.io/collector/receiver/otlpreceiver v0.162.0"
-  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.162.0"
+  - gomod: "go.opentelemetry.io/collector/receiver/otlpreceiver v0.165.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.165.1"
 
 processors:
-  - gomod: "go.opentelemetry.io/collector/processor/batchprocessor v0.162.0"
-  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.162.0"
+  - gomod: "go.opentelemetry.io/collector/processor/batchprocessor v0.165.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.165.1"
 
 providers:
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.68.0"
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.68.0"
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.68.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.71.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.71.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.71.0"
 ```
 
 Build with the builder binary:
@@ -484,7 +484,7 @@ docker run --rm \
 ### Prerequisites
 
 - Go 1.26+
-- OpenTelemetry Collector Builder (`ocb`) — [install from releases](https://github.com/open-telemetry/opentelemetry-collector-releases) (this repo builds against OCB v0.162.0)
+- OpenTelemetry Collector Builder (`ocb`) — [install from releases](https://github.com/open-telemetry/opentelemetry-collector-releases) (this repo builds against OCB v0.165.0)
 - `golangci-lint` v2.13.2 for linting — install with the command in [Lint](#lint)
 
 ### Tests
@@ -603,6 +603,32 @@ The included `collector.yaml` and `examples/plaintext/input.log` let you exercis
 
 ## Changelog
 
+### v0.8.0
+
+Dependency realignment: the module, the shipped distribution manifest and CI now
+all sit on the collector `v0.165` line (core libraries `v1.71`). No behaviour
+change — the conversion path is identical, and the `input.log` oracle produces
+the same spans down to the attributes.
+
+- The connector now requires collector core `v1.71.0` / `v0.165.0`, contrib
+  `v0.165.1` and the confmap providers `v1.71.0`. **This raises the minimum
+  collector version for anyone importing the module**, because Go's minimum
+  version selection will pull their collector core up to `v1.71.0`. That is why
+  this is a minor release and not a `v0.7.1` patch.
+- `builder-config.yaml`, `examples/quickstart/manifest.yaml` and the README
+  manifest snippet are pinned to the matching component versions, and the OCB
+  version used by CI and the quickstart Dockerfile moves to `v0.165.0`. OCB
+  generates the distribution's `go.mod` (including its requirement on the
+  `otelcol` service), so a stale builder silently drags the built distribution
+  back a release line even when the manifest is correct.
+- Added `dist_version_test.go`, which fails when these drift apart: it requires
+  every pin in the repo to come from one collector release line, requires
+  `go.mod` to match the pins, and requires the OCB version to match the
+  components it builds. The previous release shipped a distribution resolved
+  from two lines — core `v1.71` libraries alongside `otelcol` and the
+  receivers/exporters at `v0.162` — and nothing caught it, because OCB and the
+  test suite both build that mixture happily.
+
 ### v0.7.0
 
 Security, correctness and performance pass over the whole conversion path. Several defaults change; each is called out below.
@@ -657,7 +683,7 @@ Security, correctness and performance pass over the whole conversion path. Sever
 - Added a Docker-based quickstart in [`examples/quickstart`](examples/quickstart) ([#21](https://github.com/agardnerIT/logs-to-spans-otel/issues/21)): a sample `app.log` with plain-text and JSON lines using two group keys, an OCB `manifest.yaml` (file_log receiver, `logs_to_spans` connector, debug exporter), a `collector.yaml` that parses both formats, and a `Dockerfile` that builds the collector and runs it. The example emits three traces and drops the line with no group key. CI now validates the example config alongside the root configs.
 - Removed the last per-record work from the connector's global mutex ([#20](https://github.com/agardnerIT/logs-to-spans-otel/issues/20)). After [#15](https://github.com/agardnerIT/logs-to-spans-otel/issues/15) moved body extraction out of the lock, `addToGroup` still took `c.mu` once per record for a `time.AfterFunc` stop/reset, a resource-attribute deep copy on group creation, and an O(`max_groups`) eviction scan. Now: a single background reaper owns every `timeout`/`max_wait` deadline (one ticker scan instead of two timer create/stop operations per log), there are no per-group timers at all; new groups' resource attributes are deep-copied before the lock; `max_groups` eviction is O(1) off an LRU list; and `ConsumeLogs` batches a batch's records by group key so the lock is taken once per group per call instead of once per record. Flush timing is now bounded by the reaper tick (a quarter of the shorter deadline, clamped to 10ms–1s); `timeout` and `max_wait` semantics are otherwise unchanged, and the reaper is stopped deterministically on `Shutdown`. On an 8-core Apple M2 the parallel grouping benchmark (`max_logs_per_trace` disabled) runs at ~1.5M logs/sec, ~3x the ~495k single-caller baseline, and `addToGroup` falls from ~92% to ~5% of mutex-contention delay; with `max_logs_per_trace` enabled the full pipeline runs at ~735k logs/sec (~1.6x), bound by GC on trace construction rather than the lock. No config surface change.
 - Added contrib-level linting ([#19](https://github.com/agardnerIT/logs-to-spans-otel/issues/19)): a [`.golangci.yml`](.golangci.yml) mirroring opentelemetry-collector-contrib's root config (same linter set and settings, minus the contrib-tree paths that do not exist here) and a `lint` CI job running golangci-lint v2.13.2, the version contrib pins in `internal/tools/go.mod`. The first run is clean; the findings it surfaced are fixed in the same change (test context handling, an if/else chain, empty-assertion style, spelling and formatting). `go vet` is retained as a separate fast step. No user-visible behaviour change.
-- Documentation fixes: the "Including in your own collector build" snippet now matches the collector line this repo builds against (`v0.162.0` core and contrib, `v1.68.0` providers), the Go prerequisite is `1.26+`, the local-development note describes the `replaces:` block the repo actually uses, and a dead Dockerfile link was removed.
+- Documentation fixes: the "Including in your own collector build" snippet now matches the collector line this repo builds against (`v0.165.0` core and contrib, `v1.71.0` providers), the Go prerequisite is `1.26+`, the local-development note describes the `replaces:` block the repo actually uses, and a dead Dockerfile link was removed.
 - The README now opens with the quickstart instead of a three-step OCB walkthrough. Its manifest duplicated the one under [Including in your own collector build](#including-in-your-own-collector-build), so the walkthrough is gone and the top of the README is a copy-pasteable Docker run that links to [`examples/quickstart`](examples/quickstart) for the Jaeger and no-Docker paths. The builder's Docker image is documented there too, mounted at `/build` so `replaces: ../` still resolves to the repo root.
 
 ### v0.5.0
@@ -673,7 +699,7 @@ Security, correctness and performance pass over the whole conversion path. Sever
   - New `copy_resource_attributes` (default `true`) copies the source logs' resource attributes (`host.name`, `k8s.pod.name`, `service.instance.id`, ...) onto the resource of every emitted trace. Previously only `service.name` was written and all other resource context was discarded. When a group holds records from more than one resource, the first record's resource wins — the previously silent collapsing is now documented.
   - New `group_by_resource_attributes` (default empty) scopes a group by resource attribute values, so the same extracted key from different pods or services no longer merges into one trace. It is an additional dimension: `group_by_keys` / `group_by_attributes` must still match. `group.key` remains the extracted value.
   - `service_name` is now an **override** and defaults to empty. Empty preserves the source `service.name` and falls back to `logs-to-spans` only when the source has none. This is a behaviour change: previously the connector always wrote the configured `service_name` (default `logs-to-spans`), overwriting the source value.
-- Donation-readiness groundwork for [#17](https://github.com/agardnerIT/logs-to-spans-otel/issues/17): added `metadata.yaml`, `doc.go`, `config.schema.yaml`, generated `documentation.md`, the generated `internal/metadata` and `internal/metadatatest` packages, `generated_component_test.go`, a `generated_package_test.go` that runs the suite under `go.uber.org/goleak`, and the `Copyright The OpenTelemetry Authors` / `SPDX-License-Identifier: Apache-2.0` header on every Go file. Internal metrics are now built by the mdatagen-generated `TelemetryBuilder` from `metadata.yaml`. Metric names, types and values are unchanged; their HELP text now carries the `[Development]` stability suffix, and the `active_groups` gauge callback is unregistered on shutdown. Collector dependencies realigned with contrib `main` (`go 1.26.0`, collector `v1.68.0` / `v0.162.0`); `builder-config.yaml` and CI follow. The module path and on-disk directory rename to `connector/logstospansconnector` are deliberately deferred to the donation pull request.
+- Donation-readiness groundwork for [#17](https://github.com/agardnerIT/logs-to-spans-otel/issues/17): added `metadata.yaml`, `doc.go`, `config.schema.yaml`, generated `documentation.md`, the generated `internal/metadata` and `internal/metadatatest` packages, `generated_component_test.go`, a `generated_package_test.go` that runs the suite under `go.uber.org/goleak`, and the `Copyright The OpenTelemetry Authors` / `SPDX-License-Identifier: Apache-2.0` header on every Go file. Internal metrics are now built by the mdatagen-generated `TelemetryBuilder` from `metadata.yaml`. Metric names, types and values are unchanged; their HELP text now carries the `[Development]` stability suffix, and the `active_groups` gauge callback is unregistered on shutdown. Collector dependencies realigned with contrib `main` (`go 1.26.0`, collector `v1.71.0` / `v0.165.0`); `builder-config.yaml` and CI follow. The module path and on-disk directory rename to `connector/logstospansconnector` are deliberately deferred to the donation pull request.
 - Added `max_groups` (default `1000`, `0` disables) to bound the number of concurrent groups. Previously only `max_logs_per_trace` bounded each group; nothing bounded how many existed, so a high-cardinality key created one map entry and two live timers per distinct value until it timed out. When the cap is reached the **least recently updated** group is flushed early and emitted as a trace before the new group is admitted — no records are lost, but the trace boundary moves. Two internal metrics make the cap observable: `otelcol_connector_logs_to_spans_groups_evicted` (counter) and `otelcol_connector_logs_to_spans_active_groups` (gauge). There is no separate TTL option because `max_wait` already bounds a group's absolute lifetime. ([#11](https://github.com/agardnerIT/logs-to-spans-otel/issues/11))
 - Added `group_by_attributes` to read the group key from log attributes instead of the body. Attributes are searched before `group_by_keys`, so structured logs (`filelog` + `json_parser`, or any OTLP-native application) no longer need a `transform` processor to copy the field back into the body. Attribute values are stringified, so numeric and boolean fields work too. At least one of `group_by_attributes` or `group_by_keys` is now required. ([#14](https://github.com/agardnerIT/logs-to-spans-otel/issues/14))
 - Added internal metrics so operators can observe the connector on the collector's own telemetry endpoint: `otelcol_connector_logs_to_spans_logs_ingested`, `otelcol_connector_logs_to_spans_traces_created`, and `otelcol_connector_logs_to_spans_unmatched_dropped`. Unmatched records have always been dropped silently; the counter makes that visible. New [Produced metrics](#produced-metrics) table. ([#1](https://github.com/agardnerIT/logs-to-spans-otel/issues/1))

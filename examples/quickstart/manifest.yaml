@@ -5,7 +5,7 @@ dist:
   output_path: ./otelcol-dist
 
 connectors:
-  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.7.0"
+  - gomod: "github.com/agardnerIT/logs-to-spans-otel v0.8.0"
     name: "logs_to_spans"
 
 # Build the connector from the working tree, not the published v0.7.0 tag, so
@@ -15,18 +15,18 @@ replaces:
   - github.com/agardnerIT/logs-to-spans-otel => ../
 
 receivers:
-  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.162.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.165.1"
 
 processors:
   # Rebase app.log's fixed dates onto now, so the spans land inside Jaeger's
   # default "Last 1 hour" view instead of years in the past.
-  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.162.0"
+  - gomod: "github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.165.1"
 
 exporters:
-  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.162.0"
-  - gomod: "go.opentelemetry.io/collector/exporter/otlphttpexporter v0.162.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/debugexporter v0.165.0"
+  - gomod: "go.opentelemetry.io/collector/exporter/otlphttpexporter v0.165.0"
 
 providers:
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.68.0"
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.68.0"
-  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.68.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/envprovider v1.71.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/fileprovider v1.71.0"
+  - gomod: "go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.71.0"

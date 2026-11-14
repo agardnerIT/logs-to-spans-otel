@@ -71,9 +71,9 @@ ocb --config manifest.yaml
 ./otelcol-dist/otelcol-logs-to-spans-quickstart --config collector.yaml
 ```
 
-The collector builds with OCB v0.162.0. `manifest.yaml` contains a `replaces`
+The collector builds with OCB v0.165.0. `manifest.yaml` contains a `replaces`
 entry pointing at this repository, so it builds the **working tree**, not the
-published `v0.7.0` tag: a change to `connector.go` shows up in the example
+published `v0.8.0` tag: a change to `connector.go` shows up in the example
 without a release. The same pattern (and the note on how `replaces` paths are
 resolved) is in the root [`builder-config.yaml`](../../builder-config.yaml).
 
@@ -130,7 +130,7 @@ the matched remainder to the record body so span names read
 ## How the OTLP/HTTP exporter is wired
 
 `collector.yaml` adds the `otlp_http` exporter (module `otlphttpexporter`), which
-speaks OTLP over HTTP/protobuf to `/v1/traces`. In collector v0.162 the
+speaks OTLP over HTTP/protobuf to `/v1/traces`. In collector v0.165 the
 component type is `otlp_http`; the older name `otlphttp` still resolves:
 
 ```yaml
