@@ -6,6 +6,12 @@ on:
     tags: ['v*']
   pull_request:
 
+# Cancel superseded runs: a force-push or a follow-up commit to the same PR
+# makes the in-flight run obsolete, so it is stopped instead of finishing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Least privilege: this workflow only reads the repository. Without this block
 # the token inherits the repository default, which on older repositories is
 # read/write on contents, issues and pull requests - and `go test`/`go vet` run
@@ -49,9 +55,10 @@ jobs:
       # Reachable-symbol analysis of the module's whole dependency graph. For a
       # connector that ships inside other people's collectors, a vulnerable
       # transitive dependency is a vulnerability in every distribution that
-      # includes it.
+      # includes it. Pinned like every other tool in this workflow: @latest
+      # would run whatever the module proxy serves today, unreviewed.
       - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   validate-configs:
     name: Build collector and validate example configs
