@@ -432,7 +432,7 @@ func TestBoundGroupKey(t *testing.T) {
 
 	assert.Equal(t, "12345678", c.boundGroupKey("1234567890"))
 	assert.Equal(t, "12345678", c.boundGroupKey("12345678"))
-	assert.Equal(t, "", c.boundGroupKey(""))
+	assert.Empty(t, c.boundGroupKey(""))
 	// Rune-safe: the cut never splits a multi-byte character.
 	assert.Equal(t, "éééé", c.boundGroupKey(strings.Repeat("é", 10)))
 
@@ -615,7 +615,7 @@ func TestDecodeIDBytesRejectsHugeStringsBeforeDecoding(t *testing.T) {
 func TestBoundQuoted(t *testing.T) {
 	assert.Equal(t, "abc", boundQuoted("abcdef", 3))
 	assert.Equal(t, "abcdef", boundQuoted("abcdef", 100))
-	assert.Equal(t, "", boundQuoted("abcdef", 0))
+	assert.Empty(t, boundQuoted("abcdef", 0))
 	// Rune-safe: the cut never splits a multi-byte character (the result may
 	// be slightly under the room, never an invalid prefix).
 	assert.Equal(t, "é", boundQuoted(strings.Repeat("é", 10), 3))

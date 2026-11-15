@@ -1512,7 +1512,7 @@ func (c *logsToSpansConnector) extractGroupKey(lr plog.LogRecord) string {
 	for _, key := range c.config.GroupByAttributes {
 		if val, ok := attrs.Get(key); ok {
 			// valueToStringLimit bounds the conversion: a nested Map or Slice
-		// value is serialized only up to roughly the key cap, never in full,
+			// value is serialized only up to roughly the key cap, never in full,
 			// and addRecords applies the exact byte cap to whatever returns.
 			if s := valueToStringLimit(val, c.keyRuneLimit()); s != "" {
 				return s
