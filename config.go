@@ -26,6 +26,7 @@ const (
 	maxBufferedRecordsBound     = 10_000_000
 	maxRecordBytesUpperBound    = 64 << 20
 	maxGroupBytesUpperBound     = 1 << 30
+	maxGroupKeyBytesUpperBound  = 64 << 10
 	maxSpanNameLengthUpperBound = 4096
 )
 
@@ -51,7 +52,9 @@ type Config struct {
 
 	// MaxRecordBytes bounds the retained size of one buffered log record. A
 	// longer body is truncated, rune-safe, so a single huge log line cannot be
-	// retained in full. Truncation is counted by
+	// retained in full. A longer severity text is truncated by the same bound
+	// (not counted in records_truncated; that metric's contract is bodies).
+	// Truncation of the body is counted by
 	// otelcol_connector_logs_to_spans_records_truncated. 0 disables the bound.
 	MaxRecordBytes int `mapstructure:"max_record_bytes"`
 
@@ -61,6 +64,15 @@ type Config struct {
 	// max_logs_per_trace does. Records are never dropped for this bound. 0
 	// disables it.
 	MaxGroupBytes int `mapstructure:"max_group_bytes"`
+
+	// MaxGroupKeyBytes caps the length of the extracted group key, counted in
+	// bytes and truncated rune-safe. The key comes from log input (an attribute
+	// value or a body match), so without a cap one huge value is retained per
+	// group for the group's whole lifetime and echoed, without truncation, as
+	// the group.key span attribute on every emitted span. Keys that differ only
+	// past the cap collapse into one group; group_by_resource_attributes values
+	// in the internal map key are capped the same way. 0 disables the bound.
+	MaxGroupKeyBytes int `mapstructure:"max_group_key_bytes"`
 
 	// GroupByKeys is the ordered list of keys to look for in the log body, as
 	// structured map keys or as key=value pairs. At least one of GroupByKeys or
@@ -264,6 +276,12 @@ func (cfg *Config) Validate() error {
 			"max_group_bytes (%d) must be at least max_record_bytes (%d)", cfg.MaxGroupBytes, cfg.MaxRecordBytes,
 		))
 	}
+	if cfg.MaxGroupKeyBytes < 0 {
+		errs = append(errs, fmt.Errorf("max_group_key_bytes must not be negative, got %d", cfg.MaxGroupKeyBytes))
+	}
+	if cfg.MaxGroupKeyBytes > maxGroupKeyBytesUpperBound {
+		errs = append(errs, fmt.Errorf("max_group_key_bytes must not exceed %d, got %d", maxGroupKeyBytesUpperBound, cfg.MaxGroupKeyBytes))
+	}
 	if cfg.EndSpanDuration <= 0 {
 		errs = append(errs, fmt.Errorf("end_span_duration must be greater than zero, got %s", cfg.EndSpanDuration))
 	}
@@ -292,6 +310,7 @@ func createDefaultConfig() *Config {
 		MaxGroups:                 1000,
 		MaxRecordBytes:            16 << 10,
 		MaxGroupBytes:             4 << 20,
+		MaxGroupKeyBytes:          1024,
 		GroupByKeys:               []string{},
 		GroupByAttributes:         []string{},
 		GroupByResourceAttributes: []string{},

@@ -33,6 +33,9 @@ properties:
   max_group_bytes:
     description: MaxGroupBytes bounds the retained body bytes of one group. When a record would push a group past the bound, the group is flushed as a trace and a follow-on group starts with a span link back to it, exactly as max_logs_per_trace does. Records are never dropped for this bound. 0 disables it.
     type: integer
+  max_group_key_bytes:
+    description: MaxGroupKeyBytes caps the length of the extracted group key, counted in bytes and truncated rune-safe. The key comes from log input (an attribute value or a body match), so without a cap one huge value is retained per group for the group's whole lifetime and echoed, without truncation, as the group.key span attribute on every emitted span. Keys that differ only past the cap collapse into one group; group_by_resource_attributes values in the internal map key are capped the same way. 0 disables the bound.
+    type: integer
   max_groups:
     description: MaxGroups bounds the number of buffered groups. When a new group would exceed it, the least recently updated group is flushed early. 0 disables the bound.
     type: integer
@@ -40,7 +43,7 @@ properties:
     description: MaxLogsPerTrace caps the number of log records in one trace. When a group reaches the cap it is flushed as a trace and a follow-on group starts with a span link back to it. 0 disables the cap.
     type: integer
   max_record_bytes:
-    description: MaxRecordBytes bounds the retained size of one buffered log record. A longer body is truncated, rune-safe, so a single huge log line cannot be retained in full. Truncation is counted by otelcol_connector_logs_to_spans_records_truncated. 0 disables the bound.
+    description: MaxRecordBytes bounds the retained size of one buffered log record. A longer body is truncated, rune-safe, so a single huge log line cannot be retained in full. A longer severity text is truncated by the same bound (not counted in records_truncated; that metric's contract is bodies). Body truncation is counted by otelcol_connector_logs_to_spans_records_truncated. 0 disables the bound.
     type: integer
   max_span_duration:
     description: MaxSpanDuration rejects an explicit duration larger than this, which is otherwise either nonsense or an overflow of time.Duration. 0 disables the bound.

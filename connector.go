@@ -608,6 +608,10 @@ func (c *logsToSpansConnector) addRecords(key string, resource pcommon.Map, recs
 	if len(recs) == 0 {
 		return nil, nil, nil
 	}
+	// The key comes from log input, so cap it here — the single point every
+	// caller's key passes through — before it can become a map key, an LRU or
+	// heap entry, or the group.key attribute echoed on every emitted span.
+	key = c.boundGroupKey(key)
 	mapKey := c.buildMapKey(key, resource)
 	now := time.Now()
 
@@ -1156,6 +1160,14 @@ func extractLogRecord(lr plog.LogRecord, cfg *Config, opts extractOptions) *logR
 		break
 	}
 
+	// The severity text is log input too, so it is bounded by the same
+	// max_record_bytes bound as the body. Deliberately not counted in
+	// records_truncated: that metric's contract is log bodies (metadata.yaml),
+	// and severity truncation is expected to be rare.
+	if cfg.MaxRecordBytes > 0 && len(rec.severity) > cfg.MaxRecordBytes {
+		rec.severity = truncateBytes(rec.severity, cfg.MaxRecordBytes)
+	}
+
 	rec.traceID, rec.spanID = extractTraceContext(lr, cfg)
 
 	body := valueToStringLimit(lr.Body(), opts.bodyLimit)
@@ -1208,8 +1220,15 @@ func extractTraceContext(lr plog.LogRecord, cfg *Config) (pcommon.TraceID, pcomm
 func decodeIDBytes(v pcommon.Value, size int) ([]byte, bool) {
 	switch v.Type() {
 	case pcommon.ValueTypeStr:
-		b, err := hex.DecodeString(strings.TrimSpace(v.Str()))
-		if err != nil || len(b) != size {
+		// Length first: hex.DecodeString allocates len(src)/2 bytes before it
+		// validates anything, so decoding first would let one huge attribute
+		// value cost a huge transient allocation per record per key.
+		s := strings.TrimSpace(v.Str())
+		if len(s) != 2*size {
+			return nil, false
+		}
+		b, err := hex.DecodeString(s)
+		if err != nil {
 			return nil, false
 		}
 		return b, true
@@ -1334,13 +1353,17 @@ func byteBudgetForRunes(n int) int {
 // writeValueJSON writes a JSON-ish encoding of v into b, stopping once b holds
 // budget bytes. The result is a prefix of the full encoding, so a truncated
 // value is not necessarily valid JSON - it is only ever used as display text.
+// String and bytes elements are themselves cut to the remaining budget
+// (boundQuoted): the budget is checked between elements, so without that cut
+// one huge string element would be quoted in full - and quoting can expand a
+// byte up to six times - even though only the first few runes survive.
 func writeValueJSON(b *strings.Builder, v pcommon.Value, budget int) {
 	if b.Len() >= budget {
 		return
 	}
 	switch v.Type() {
 	case pcommon.ValueTypeStr:
-		b.WriteString(strconv.Quote(v.Str()))
+		b.WriteString(strconv.Quote(boundQuoted(v.Str(), budget-b.Len())))
 	case pcommon.ValueTypeInt:
 		b.WriteString(strconv.FormatInt(v.Int(), 10))
 	case pcommon.ValueTypeDouble:
@@ -1348,7 +1371,7 @@ func writeValueJSON(b *strings.Builder, v pcommon.Value, budget int) {
 	case pcommon.ValueTypeBool:
 		b.WriteString(strconv.FormatBool(v.Bool()))
 	case pcommon.ValueTypeBytes:
-		b.WriteString(strconv.Quote(string(v.Bytes().AsRaw())))
+		b.WriteString(strconv.Quote(boundQuoted(string(v.Bytes().AsRaw()), budget-b.Len())))
 	case pcommon.ValueTypeMap:
 		b.WriteByte('{')
 		first := true
@@ -1360,7 +1383,7 @@ func writeValueJSON(b *strings.Builder, v pcommon.Value, budget int) {
 				b.WriteByte(',')
 			}
 			first = false
-			b.WriteString(strconv.Quote(key))
+			b.WriteString(strconv.Quote(boundQuoted(key, budget-b.Len())))
 			b.WriteByte(':')
 			writeValueJSON(b, val, budget)
 		}
@@ -1382,6 +1405,21 @@ func writeValueJSON(b *strings.Builder, v pcommon.Value, budget int) {
 	}
 }
 
+// boundQuoted cuts s so that quoting it cannot blow past the remaining budget.
+// Quoting can expand a byte up to six times (\\u00XX), so the cut is
+// conservative; the caller re-bounds the final string in runes anyway and the
+// result is display text, never parsed. room is at least 1 when called: the
+// writeValueJSON entry check guarantees the builder is under budget.
+func boundQuoted(s string, room int) string {
+	if room <= 0 {
+		return ""
+	}
+	if len(s) > room {
+		s = truncateBytes(s, room)
+	}
+	return s
+}
+
 // copyResourceAttributes deep-copies a source resource attribute set. The
 // result is safe to keep after ConsumeLogs returns; the upstream pdata it came
 // from is not (the connector declares Capabilities{MutatesData: false}).
@@ -1391,6 +1429,37 @@ func copyResourceAttributes(resource pcommon.Map) pcommon.Map {
 	return out
 }
 
+// keyRuneLimit is the rune limit handed to valueToStringLimit when converting
+// a candidate group-key value, so a nested Map or Slice value is never
+// serialized in full only to be truncated afterwards. It reads
+// max_group_key_bytes as a rune count: for a Map or Slice value the
+// serialization stops after roughly cap*4 bytes, and boundGroupKey (or the
+// chokepoint in addRecords) applies the exact byte cap. max_group_key_bytes = 0
+// disables the bound, so it maps to fullBody.
+func (c *logsToSpansConnector) keyRuneLimit() int {
+	if c.config.MaxGroupKeyBytes > 0 {
+		return c.config.MaxGroupKeyBytes
+	}
+	return fullBody
+}
+
+// boundGroupKey caps a group key at max_group_key_bytes, rune-safe. It is
+// applied in addRecords, the single point every caller's key passes through,
+// and to the resource-attribute components of the internal map key. Keys that
+// differ only past the cap collapse into one group; that is the documented
+// cost of bounding attacker-influenced input.
+func (c *logsToSpansConnector) boundGroupKey(s string) string {
+	if c.config.MaxGroupKeyBytes <= 0 || len(s) <= c.config.MaxGroupKeyBytes {
+		return s
+	}
+	if cut := truncateBytes(s, c.config.MaxGroupKeyBytes); cut != "" {
+		return cut
+	}
+	// Degenerate input (a run of UTF-8 continuation bytes has no valid
+	// non-empty prefix): keep a raw byte prefix rather than dropping the key.
+	return s[:c.config.MaxGroupKeyBytes]
+}
+
 // buildMapKey returns the key used in the internal groups map. Without
 // group_by_resource_attributes it is exactly the extracted key. With it, the
 // configured resource attribute values are appended so the same extracted
@@ -1398,7 +1467,9 @@ func copyResourceAttributes(resource pcommon.Map) pcommon.Map {
 // length-prefixed, so distinct scopes can never collide, even when a value
 // contains the separator character. A resource that is missing one of the
 // configured attributes contributes an empty component and therefore collapses
-// with other resources that are also missing it.
+// with other resources that are also missing it. Every component is capped at
+// max_group_key_bytes like the extracted key, so a huge resource attribute
+// cannot be retained per group either.
 func (c *logsToSpansConnector) buildMapKey(key string, resource pcommon.Map) string {
 	if len(c.config.GroupByResourceAttributes) == 0 {
 		return key
@@ -1415,7 +1486,10 @@ func (c *logsToSpansConnector) buildMapKey(key string, resource pcommon.Map) str
 	for _, name := range c.config.GroupByResourceAttributes {
 		value := ""
 		if v, ok := resource.Get(name); ok {
-			value = valueToString(v)
+			// Capped like the extracted key: these values also end up in the
+			// internal map key, so a huge resource attribute cannot be retained
+			// per group either. Values that differ only past the cap collapse.
+			value = c.boundGroupKey(valueToStringLimit(v, c.keyRuneLimit()))
 		}
 		appendComponent(value)
 	}
@@ -1437,7 +1511,10 @@ func (c *logsToSpansConnector) extractGroupKey(lr plog.LogRecord) string {
 	attrs := lr.Attributes()
 	for _, key := range c.config.GroupByAttributes {
 		if val, ok := attrs.Get(key); ok {
-			if s := valueToString(val); s != "" {
+			// valueToStringLimit bounds the conversion: a nested Map or Slice
+		// value is serialized only up to roughly the key cap, never in full,
+			// and addRecords applies the exact byte cap to whatever returns.
+			if s := valueToStringLimit(val, c.keyRuneLimit()); s != "" {
 				return s
 			}
 		}
@@ -1453,7 +1530,10 @@ func (c *logsToSpansConnector) extractGroupKey(lr plog.LogRecord) string {
 		m := body.Map()
 		for _, key := range c.config.GroupByKeys {
 			if val, ok := m.Get(key); ok {
-				s := val.AsString()
+				// Bounded like the attribute path: AsString on a nested value
+				// JSON-serializes it in full, so the conversion is capped at the
+				// key cap's rune budget and addRecords applies the byte cap.
+				s := valueToStringLimit(val, c.keyRuneLimit())
 				if s != "" {
 					return s
 				}

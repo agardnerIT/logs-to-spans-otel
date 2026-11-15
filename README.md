@@ -178,7 +178,7 @@ Each flushed group becomes one `ResourceSpans` batch:
 | Span kind | `Internal` |
 | Span start | the log's `Timestamp`, falling back to `ObservedTimestamp` when `Timestamp` is unset. When the record carries neither — or carries a timestamp that cannot be represented, such as one written from a zero `time.Time` — the connector stamps the time it processed the record and counts it in `records_without_timestamp`. A missing timestamp never produces a 1970 or 1754 span. |
 | Span end | `start + duration`, where duration is `duration_keys` → time delta to the next log → `end_span_duration` for the last span |
-| Span attributes | `group.key` always; `log.severity` only when non-empty; `log.body` only when `include_body_attribute: true`. The body is truncated at `max_record_bytes` either way. |
+| Span attributes | `group.key` always, capped at `max_group_key_bytes`; `log.severity` only when non-empty, truncated at `max_record_bytes`; `log.body` only when `include_body_attribute: true`, truncated at `max_record_bytes`. |
 | Parent | the preceding span in the same trace; the first span has no parent |
 | Links | the span for each log record links to the originating trace/span when the record carried trace context — see [Linking to the originating trace](#linking-to-the-originating-trace). In addition, the first span of a follow-on group links to the last span of the previous group's trace, so a group split by `max_logs_per_trace` stays connected. A span can carry both kinds of link. |
 
@@ -234,14 +234,14 @@ Log records are **application-controlled input**. Treat everything the connector
 |---------|---------|-----------------|
 | Span name | the log body, up to `max_span_name_length` runes | change `span_name_template`, lower `max_span_name_length` |
 | `log.body` attribute | the log body | off by default; `include_body_attribute: false` |
-| `group.key` attribute | the extracted key — often a user, session or request ID | group on a lower-cardinality value, or drop the attribute upstream |
+| `group.key` attribute | the extracted key — often a user, session or request ID | capped at `max_group_key_bytes` (default 1 KiB); group on a lower-cardinality value, or drop the attribute upstream |
 | Resource attributes | everything the source resource carries (k8s names, host IP, cloud account) | `copy_resource_attributes: false` |
 | Span links | `trace_id_keys` / `span_id_keys` from the record, or record-level trace context | empty the key lists, or `require_span_id: true` |
 | Internal metrics and logs | counts, and `group_key` at `DEBUG` | keep the collector's own telemetry access-controlled |
 
 Practical rules:
 
-- **Bound the memory a producer can pin.** `max_record_bytes` (per record), `max_group_bytes` (per group), `max_groups` (number of groups) and `max_logs_per_trace` (records per trace) are all enforced by default. A single application that logs a megabyte body per line cannot drive the collector to OOM, and with the shipped defaults the worst case is `max_groups × max_group_bytes`, not `max_groups × max_logs_per_trace × body size`.
+- **Bound the memory a producer can pin.** `max_record_bytes` (per record), `max_group_key_bytes` (per key), `max_group_bytes` (per group), `max_groups` (number of groups) and `max_logs_per_trace` (records per trace) are all enforced by default. A single application that logs a megabyte body per line cannot drive the collector to OOM, and with the shipped defaults the worst case is `max_groups × max_group_bytes`, not `max_groups × max_logs_per_trace × body size`.
 - **Do not ship `debug` at `verbosity: detailed`.** It prints every attribute — including group keys and log bodies — to collector stdout, which is usually collected with broader access and longer retention than the trace backend. The shipped examples use `normal`.
 - **TLS.** The example configs use `insecure: true` only against loopback. Any endpoint that leaves the host carries user and session IDs in plaintext unless you enable TLS with verification.
 - **Group keys are not isolated by default.** One pipeline serves every tenant whose logs reach it; without `group_by_resource_attributes`, records from different sources that share an extracted value merge into one trace. See [Scoping groups by resource](#scoping-groups-by-resource).
@@ -260,6 +260,7 @@ Practical rules:
 | `max_logs_per_trace` | int | `100` | **Max logs per trace.** Maximum number of log records in a single group/trace. When the limit is reached, the current group is flushed early and a new group starts. Set to `0` for no limit. Traces are connected via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links). |
 | `max_record_bytes` | int | `16384` | **Max retained bytes per log record.** A longer body is truncated, rune-safe, and counted in `records_truncated`. Bounds the memory a single hostile or noisy log line can hold. Set to `0` for no limit. See [Handling sensitive data and untrusted logs](#handling-sensitive-data-and-untrusted-logs). |
 | `max_group_bytes` | int | `4194304` | **Max retained body bytes per group.** A record that would push a group past the bound is preceded by a flush: the group becomes a trace and a linked follow-on group starts, exactly like `max_logs_per_trace`. Records are never dropped for this bound. Must be at least `max_record_bytes` when both are set. Set to `0` for no limit. |
+| `max_group_key_bytes` | int | `1024` | **Max group key bytes.** Caps the extracted group key, rune-safe. The key comes from log input (attribute values or body matches); without a cap one huge value is retained per group for its whole lifetime and echoed as `group.key` on every emitted span. Keys that differ only past the cap collapse into one group, and `group_by_resource_attributes` values in the internal map key are capped the same way. `0` disables the cap. |
 | `max_groups` | int | `1000` | **Max concurrent groups.** Hard cap on the number of buffered groups. When opening a new group would exceed it, the least recently updated group is flushed early and emitted as a trace before the new group is admitted. Set to `0` for no limit. See [Bounding memory with `max_groups`](#bounding-memory-with-max_groups). |
 | `group_by_keys` | string list | `[]` | Keys to extract from each log body and group by (tried in order). Matched literally, not as regexes. At least one of `group_by_keys` or `group_by_attributes` must be set. See [Key extraction](#key-extraction). |
 | `group_by_attributes` | string list | `[]` | Log attribute names to group by (tried in order). Checked **before** `group_by_keys`; attribute values are stringified. Matched literally, not as regexes. See [Key extraction](#key-extraction). |
@@ -292,7 +293,8 @@ Set `max_groups: 0` to disable the cap — the same convention as `max_logs_per_
 
 `max_groups` bounds the number of groups but not their size, so two byte bounds complete the picture:
 
-- `max_record_bytes` (default 16 KiB) truncates one oversized body, rune-safe, and counts it in `records_truncated`.
+- `max_record_bytes` (default 16 KiB) truncates one oversized body — and, by the same bound, an oversized severity text — rune-safe, and counts the body case in `records_truncated`.
+- `max_group_key_bytes` (default 1 KiB) caps the extracted key, so one huge attribute value cannot be retained per group for its lifetime or echoed onto every emitted span.
 - `max_group_bytes` (default 4 MiB) flushes a group that would grow past it and starts a linked follow-on group, the same way `max_logs_per_trace` does. No record is dropped.
 
 With the defaults the connector retains at most about `max_groups × max_group_bytes` of body text (4 GiB at the shipped defaults), and a single producer can no longer make that unbounded. `Config.Validate` also rejects absurd combinations (for example `max_groups × max_logs_per_trace` above ten million buffered records) at startup rather than at OOM.

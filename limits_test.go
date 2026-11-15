@@ -6,6 +6,7 @@ package logs_to_spans
 import (
 	"encoding/hex"
 	"math"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -418,4 +419,229 @@ func TestExtractLogRecordAllocationBudget(t *testing.T) {
 		_ = extractLogRecord(lr, cfg, opts)
 	})
 	assert.LessOrEqual(t, allocs, float64(45), "extractLogRecord allocates %.0f times, budget is 45", allocs)
+}
+
+// --- Bounds fixed by #52, #53, #54 and #55 -------------------------------
+
+// TestBoundGroupKey pins the max_group_key_bytes cap: byte-counted, rune-safe,
+// disabled by 0.
+func TestBoundGroupKey(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.MaxGroupKeyBytes = 8
+	c := &logsToSpansConnector{config: cfg}
+
+	assert.Equal(t, "12345678", c.boundGroupKey("1234567890"))
+	assert.Equal(t, "12345678", c.boundGroupKey("12345678"))
+	assert.Equal(t, "", c.boundGroupKey(""))
+	// Rune-safe: the cut never splits a multi-byte character.
+	assert.Equal(t, "éééé", c.boundGroupKey(strings.Repeat("é", 10)))
+
+	// 0 disables the bound.
+	cfg0 := createDefaultConfig()
+	cfg0.MaxGroupKeyBytes = 0
+	c0 := &logsToSpansConnector{config: cfg0}
+	assert.Equal(t, strings.Repeat("é", 10), c0.boundGroupKey(strings.Repeat("é", 10)))
+}
+
+// TestMaxGroupKeyBytesDefault pins the shipped default.
+func TestMaxGroupKeyBytesDefault(t *testing.T) {
+	assert.Equal(t, 1024, createDefaultConfig().MaxGroupKeyBytes)
+}
+
+func TestMaxGroupKeyBytesValidate(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.MaxGroupKeyBytes = -1
+	require.ErrorContains(t, cfg.Validate(), "max_group_key_bytes")
+
+	cfg = validTestConfig()
+	cfg.MaxGroupKeyBytes = maxGroupKeyBytesUpperBound + 1
+	require.ErrorContains(t, cfg.Validate(), "max_group_key_bytes")
+}
+
+// TestBuildMapKeyCapsResourceComponents covers the scoping half of #52: the
+// group_by_resource_attributes values also end up in the internal map key, so
+// they are capped the same way. Resources that differ only past the cap share
+// a map key.
+func TestBuildMapKeyCapsResourceComponents(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.MaxGroupKeyBytes = 8
+	cfg.GroupByResourceAttributes = []string{"tenant"}
+	c := &logsToSpansConnector{config: cfg}
+
+	res := pcommon.NewMap()
+	res.PutStr("tenant", strings.Repeat("x", 100))
+	key := c.buildMapKey("user", res)
+
+	res2 := pcommon.NewMap()
+	res2.PutStr("tenant", strings.Repeat("x", 100)+"tail")
+	assert.Equal(t, key, c.buildMapKey("user", res2),
+		"resources that differ only past the cap must share a map key")
+
+	assert.Contains(t, key, "8:xxxxxxxx", "the component holds the capped value, length-prefixed")
+}
+
+// TestExtractGroupKeyBoundsHugeValues covers the extraction half of #52: a
+// huge attribute value or body value is bounded during conversion, not only
+// when it reaches addRecords.
+func TestExtractGroupKeyBoundsHugeValues(t *testing.T) {
+	sink := newTestSink()
+
+	cfg := createDefaultConfig()
+	cfg.GroupByAttributes = []string{"user.id"}
+	cfg.MaxGroupKeyBytes = 8
+	conn := createTestConnector(t, cfg, sink)
+	c := conn.(*logsToSpansConnector)
+
+	lr := newLogRecordWithAttrs("body", time.Now(), "INFO",
+		map[string]string{"user.id": strings.Repeat("u", 100)})
+	assert.Equal(t, strings.Repeat("u", 8), c.extractGroupKey(lr))
+
+	// Structured body, string value.
+	cfg2 := createDefaultConfig()
+	cfg2.GroupByKeys = []string{"user_id"}
+	cfg2.MaxGroupKeyBytes = 8
+	conn2 := createTestConnector(t, cfg2, sink)
+	c2 := conn2.(*logsToSpansConnector)
+
+	body := plog.NewLogs().ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	body.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+	body.Body().SetEmptyMap().PutStr("user_id", strings.Repeat("v", 100))
+	assert.Equal(t, strings.Repeat("v", 8), c2.extractGroupKey(body))
+
+	// Structured body, nested Map value: the valueToStringLimit rune budget
+	// bounds the serialization (never the full JSON), and the result is at
+	// most the cap in runes.
+	nested := plog.NewLogs().ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	nested.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+	outer := nested.Body().SetEmptyMap().PutEmptyMap("user_id")
+	outer.PutStr("deep", strings.Repeat("w", 1000))
+	got := c2.extractGroupKey(nested)
+	assert.LessOrEqual(t, len([]rune(got)), 8)
+}
+
+// TestMaxGroupKeyBytesTruncatesEmittedKeyAndMergesCollidingKeys is the
+// end-to-end half of #52: the group.key attribute on every emitted span is the
+// capped key, and two records whose keys differ only past the cap land in one
+// group (one trace), while a key under the cap stays separate.
+func TestMaxGroupKeyBytesTruncatesEmittedKeyAndMergesCollidingKeys(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByAttributes = []string{"user.id"}
+	cfg.Timeout = 20 * time.Millisecond
+	cfg.MaxGroupKeyBytes = 8
+	conn := createTestConnector(t, cfg, sink)
+
+	huge := strings.Repeat("é", 10) // 20 bytes; the cap keeps 4 runes
+	sendLogs(t, conn, []plog.LogRecord{
+		newLogRecordWithAttrs("one", time.Now(), "INFO", map[string]string{"user.id": huge}),
+		newLogRecordWithAttrs("two", time.Now(), "INFO", map[string]string{"user.id": huge + "tail"}),
+		newLogRecordWithAttrs("three", time.Now(), "INFO", map[string]string{"user.id": "short"}),
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	traces := flatTraces(sink)
+	require.Len(t, traces, 2, "keys that differ only past the cap collapse into one group")
+
+	mergedIdx, singleIdx := -1, -1
+	for i, td := range traces {
+		if td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().Len() == 2 {
+			mergedIdx = i
+		} else {
+			singleIdx = i
+		}
+	}
+	require.NotEqual(t, -1, mergedIdx, "the two records with huge keys share one trace")
+	require.NotEqual(t, -1, singleIdx)
+
+	merged := traces[mergedIdx].ResourceSpans().At(0).ScopeSpans().At(0)
+	for i := range merged.Spans().Len() {
+		val, ok := merged.Spans().At(i).Attributes().Get("group.key")
+		require.True(t, ok)
+		assert.Equal(t, "éééé", val.Str())
+	}
+	val, ok := traces[singleIdx].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().Get("group.key")
+	require.True(t, ok)
+	assert.Equal(t, "short", val.Str())
+}
+
+// TestMaxRecordBytesTruncatesSeverityText covers #53: the severity text is log
+// input too, so it is bounded by the same max_record_bytes bound as the body.
+func TestMaxRecordBytesTruncatesSeverityText(t *testing.T) {
+	sink := newTestSink()
+	cfg := createDefaultConfig()
+	cfg.GroupByKeys = []string{"user"}
+	cfg.Timeout = 20 * time.Millisecond
+	cfg.MaxRecordBytes = 16
+	conn := createTestConnector(t, cfg, sink)
+
+	sendLogs(t, conn, []plog.LogRecord{
+		newLogRecord("user=123 x", time.Now(), strings.Repeat("é", 64)),
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	traces := flatTraces(sink)
+	require.Len(t, traces, 1)
+	val, ok := traces[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().Get("log.severity")
+	require.True(t, ok)
+	assert.Equal(t, "éééééééé", val.Str(), "truncated rune-safe to max_record_bytes bytes")
+}
+
+// TestDecodeIDBytesRejectsHugeStringsBeforeDecoding covers #54:
+// hex.DecodeString allocates len(src)/2 bytes before validating anything, so
+// the length must be checked first. A wrong-length string must be rejected
+// without a proportional allocation, whatever its content.
+func TestDecodeIDBytesRejectsHugeStringsBeforeDecoding(t *testing.T) {
+	hugeValidHex := pcommon.NewValueStr(strings.Repeat("ab", 1<<20)) // valid hex, wrong length
+	hugeNonHex := pcommon.NewValueStr(strings.Repeat("z", 2<<20))
+
+	_, ok := decodeIDBytes(hugeValidHex, len(pcommon.TraceID{}))
+	assert.False(t, ok)
+	_, ok = decodeIDBytes(hugeNonHex, len(pcommon.TraceID{}))
+	assert.False(t, ok)
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, _ = decodeIDBytes(hugeValidHex, len(pcommon.TraceID{}))
+	runtime.ReadMemStats(&after)
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(512<<10),
+		"rejecting a wrong-length hex string must not decode (and allocate) it first")
+}
+
+// TestBoundQuoted pins the per-element bound in writeValueJSON (#55): the cut
+// is rune-safe and no-op when the value already fits.
+func TestBoundQuoted(t *testing.T) {
+	assert.Equal(t, "abc", boundQuoted("abcdef", 3))
+	assert.Equal(t, "abcdef", boundQuoted("abcdef", 100))
+	assert.Equal(t, "", boundQuoted("abcdef", 0))
+	// Rune-safe: the cut never splits a multi-byte character (the result may
+	// be slightly under the room, never an invalid prefix).
+	assert.Equal(t, "é", boundQuoted(strings.Repeat("é", 10), 3))
+}
+
+// TestExtractionBoundedForHugeNestedStringValue covers #55: one huge string
+// element inside a Map body must not be quoted in full when the template only
+// reads a bounded prefix. MemStats, not AllocsPerRun: the bug is allocation
+// *size*, not count.
+func TestExtractionBoundedForHugeNestedStringValue(t *testing.T) {
+	logs := plog.NewLogs()
+	lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+	inner := lr.Body().SetEmptyMap().PutEmptyMap("outer")
+	inner.PutStr("msg", strings.Repeat("x", 1<<20))
+
+	cfg := createDefaultConfig() // {truncated:120:body}, max_record_bytes 16 KiB
+	opts := extractOptionsFor(cfg, mustCompileTemplate(t, cfg.SpanNameTemplate))
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	rec := extractLogRecord(lr, cfg, opts)
+	runtime.ReadMemStats(&after)
+
+	assert.Len(t, []rune(rec.body), 120, "the bounded prefix is still produced")
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(256<<10),
+		"extracting a bounded prefix of a 1 MiB nested string must not serialize it in full")
 }
