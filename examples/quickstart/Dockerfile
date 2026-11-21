@@ -7,7 +7,7 @@
 # comment. A tag is mutable: rebuilding the same commit would otherwise produce
 # a different image, and a compromised or mistagged upstream tag would flow
 # straight into the published quickstart image.
-FROM golang:1.26@sha256:978e0a4e3d953662577d784471db27742f543ab09eead06839a838188c73314b AS builder
+FROM golang:1.27@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf AS builder
 
 # GOTOOLCHAIN=local stops the builder from silently downloading a different Go
 # toolchain mid-build; -mod=readonly stops it from rewriting go.mod/go.sum.
